@@ -540,7 +540,7 @@ public final class MainHook extends XposedModule {
         // 底栏的状态由上面的 installBottomBarPrune 决定（资源 id 在不在已经不重要，
         // 只要能拿到 tab 文案就能筛）；这里只保留资源 id 解析作为补充信息。
         probeUi(Config.F_BOTTOM_BAR, K_BOTTOM_NAV, K_TAB_LABEL_LARGE, K_TAB_LABEL_SMALL);
-        probeUi(Config.F_TOP_BANNER, K_TOP_STAGE);
+        probeUi(Config.F_TOP_BANNER, K_TOP_STAGE, K_TOP_BANNER);
 
         probeUi(Config.F_MINE_UPGRADE, K_MINE_UPGRADE);
         probeUi(Config.F_MINE_UNINSTALL, K_MINE_UNINSTALL);
@@ -1012,6 +1012,43 @@ public final class MainHook extends XposedModule {
         }
     }
 
+    /**
+     * 隐藏首页顶部的横幅推广轮播。
+     *
+     * ── 踩过的坑，务必保留这段约束 ──
+     * 最初的写法是直接 `findViewById(stage_inner_listview)` 隐藏整个外层列表，
+     * 结果**整个首页空了**：真机实测首页可见文案从 30 条掉到 4 条。
+     *
+     * 原因看真机视图树就清楚了：
+     *   stage_inner_listview  RecyclerView  [0,233][1080,2106]  ← 整屏内容区
+     *     ├─ recycler_view    RecyclerView  [0,269][1080,818]    ← 顶部推广轮播
+     *     ├─ card_container   [48,818][1032,1064]                 ← 应用卡 1
+     *     ├─ card_container   [48,1064][1032,1286]                ← 应用卡 2
+     *     └─ ……一直到 2106
+     * 横幅和下面**所有应用卡片**是同一个 RecyclerView 的子项，
+     * 隐藏外层 = 横幅和应用列表一起没了。
+     *
+     * 所以拿 stage_inner_listview 当**锚点**（证明我们在首页这个 stage 上），
+     * 只在它的子树里找 recycler_view 去隐藏——下面的应用卡片自然上移补位。
+     *
+     * 为什么不能直接按 recycler_view 全树找：「我的」页的卡片列表也叫
+     * recycler_view（com.coui.card.api.view.NestedScrollingRecyclerView，真机实测），
+     * 直接找会连「我的」页一起打穿。限定在 stage 的子树内就没事。
+     */
+    private static void hideTopBanner(View root) {
+        int stageId = ID[K_TOP_STAGE];
+        int bannerId = ID[K_TOP_BANNER];
+        if (stageId == 0) return;
+        try {
+            View stage = root.findViewById(stageId);
+            if (!(stage instanceof ViewGroup)) return;
+            View banner = bannerId == 0 ? null : ((ViewGroup) stage).findViewById(bannerId);
+            if (banner == null) return;
+            if (banner.getVisibility() != View.GONE) banner.setVisibility(View.GONE);
+            hit(Config.F_TOP_BANNER);
+        } catch (Throwable ignored) { }
+    }
+
     /** 每次触达只做十几次 findViewById（按 id 精确命中），不做任何树遍历。 */
     private static void applyRules(Activity activity) {
         View decor;
@@ -1022,7 +1059,7 @@ public final class MainHook extends XposedModule {
         // 底栏不再在这里按文案筛：改由 buildMenuView 钩子在建视图时移除，
         // 见 installBottomBarPrune —— 延迟隐藏正是「闪一下」的成因。
         // 均分不需要任何额外干预：菜单项一旦设为不可见，COUI 的 onMeasure 自然按新项数均分。
-        if (ON[I_TOPBANNER]) hide(decor, ID[K_TOP_STAGE], Config.F_TOP_BANNER);
+        if (ON[I_TOPBANNER]) hideTopBanner(decor);
         if (ON[I_FLOAT]) hide(decor, ID[K_FLOAT_AD], Config.F_FLOAT_AD);
 
         boolean allThree = ON[I_UPGRADE] && ON[I_UNINSTALL] && ON[I_DOWNLOAD];
@@ -1708,7 +1745,8 @@ public final class MainHook extends XposedModule {
     private static final int K_MINE_REC_RATING = 17;
     private static final int K_TOP_STAGE = 18;
     private static final int K_NAV_TIP = 19;
-    private static final int ID_COUNT = 20;
+    private static final int K_TOP_BANNER = 20;
+    private static final int ID_COUNT = 21;
 
     private static final String[] ID_NAMES = {
             Config.ID_BOTTOM_TAB, Config.ID_BOTTOM_NAV, Config.ID_FLOAT_AD,
@@ -1718,7 +1756,7 @@ public final class MainHook extends XposedModule {
             Config.ID_TAB_LABEL_LARGE, Config.ID_TAB_LABEL_SMALL,
             Config.ID_MINE_CARD_TITLE, Config.ID_MINE_REC_CARD,
             Config.ID_MINE_REC_ITEM, Config.ID_MINE_REC_RATING,
-            Config.ID_TOP_STAGE, Config.ID_NAV_TIP,
+            Config.ID_TOP_STAGE, Config.ID_NAV_TIP, Config.ID_TOP_BANNER,
     };
     private static final int[] ID = new int[ID_COUNT];
     private static volatile boolean idsResolved;

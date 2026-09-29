@@ -82,7 +82,7 @@ final class Config {
             "闸门：msp DialogHelper 的展示入口置空 + 留存判断恒 false（包名未混淆，跨版本稳）",
             "闸门：安装引导 Intent 构造返回 null（App 自身已做空判断）",
             "在底栏「建视图」那一步移除名单外的 tab（不是先画后藏，所以切页不闪）；剩余 tab 测量时按栏宽均分",
-            "按资源 id stage_inner_listview 隐藏整块推广轮播区",
+            "只隐藏 stage_inner_listview 子树里那个 recycler_view（顶部推广轮播）——外层列表同时装着下面所有应用卡片，隐藏它等于整个首页都没了",
             "闸门：COUINavigationView.setTipsViewByItemId 置空，角标根本不挂上去（不是事后隐藏）",
             "按资源 id ll_upgrade 隐藏；三项全开时整张卡一起隐藏",
             "按资源 id ll_uninstall 隐藏；三项全开时整张卡一起隐藏",
@@ -126,8 +126,10 @@ final class Config {
     static final String ID_MINE_INDIC   = "banner_indicator";
     static final String ID_MINE_VIP     = "vip_layout";
     static final String ID_MINE_LIST    = "mine_list_view";
-    /** 首页顶部整块推广轮播区（含可滑动的大图卡片）。 */
+    /** 首页内容区的外层列表：横幅轮播和下面所有应用卡片都是它的子项，只作锚点用。 */
     static final String ID_TOP_STAGE    = "stage_inner_listview";
+    /** 顶部横幅推广轮播本身（只在上面那个列表的子树里找，避免误伤「我的」页的同名 id）。 */
+    static final String ID_TOP_BANNER   = "recycler_view";
     /** 底栏 tab 上的角标（ViewStub，未 inflate 时不占空间）。 */
     static final String ID_NAV_TIP      = "vs_warning_tip";
     // 「我的」页卡片是复用的通用布局（cl_content + tv_title/tv_subtitle/tv_button），
