@@ -18,7 +18,7 @@ final class Config {
      * 规则结构版本：只有规则语义变化时才 +1（会让锚点缓存失效重探）。
      */
     /** 规则结构版本：规则语义变了就 +1，缓存 token 随之失效、重新探测。 */
-    static final String SCHEMA = "4";
+    static final String SCHEMA = "6";
 
     /** RemotePreferences 组名。 */
     static final String GROUP = "io.github.heytapmarketclean_settings";
@@ -30,6 +30,8 @@ final class Config {
     static final String F_MSP_AD         = "msp_ad";          // msp 营销弹窗（启动/留存/提示）
     static final String F_BOOT_GUIDE     = "boot_guide";      // 开机必备引导页
     static final String F_BOTTOM_BAR     = "bottom_bar";      // 底部导航栏
+    static final String F_TOP_BANNER     = "top_banner";      // 首页顶部大图推广轮播
+    static final String F_NAV_BADGE      = "nav_badge";       // 底栏 tab 上的红点/数字角标
     static final String F_MINE_UPGRADE   = "mine_upgrade";    // 待更新
     static final String F_MINE_UNINSTALL = "mine_uninstall";  // 应用卸载
     static final String F_MINE_DOWNLOAD  = "mine_download";   // 下载管理
@@ -41,14 +43,14 @@ final class Config {
 
     static final String[] FEATURES = {
             F_FLOAT_AD, F_AI_BUBBLE, F_CTA_DIALOG, F_MSP_AD, F_BOOT_GUIDE,
-            F_BOTTOM_BAR,
+            F_BOTTOM_BAR, F_TOP_BANNER, F_NAV_BADGE,
             F_MINE_UPGRADE, F_MINE_UNINSTALL, F_MINE_DOWNLOAD,
             F_MINE_CLEAN, F_MINE_HEALTH, F_MINE_BANNER, F_MINE_RECOMMEND, F_MINE_VIP,
     };
 
     static final String[] FEATURE_LABELS = {
             "悬浮广告", "AI 搜索引导气泡", "活动弹窗（CTA）", "营销弹窗（msp）", "开机必备引导页",
-            "底栏推广入口",
+            "底栏推广入口", "顶部横幅推广位", "底栏红点角标",
             "待更新", "应用卸载", "下载管理",
             "存储空间清理", "应用健康状态", "热门好礼横幅", "“继续探索”推荐卡", "游戏 VIP 卡",
     };
@@ -60,7 +62,9 @@ final class Config {
             "任意页弹出的活动/广告弹窗",
             "冷启动与切页时弹出的营销弹窗（msp SDK）",
             "冷启动后的“开机必备”全屏引导页",
-            "首页底部导航栏（只隐藏推广 tab，保留切页）",
+            "首页底部导航栏（只留名单内的 tab，并平均铺满整条栏）",
+            "首页顶部横向大图推广位（可滑动的推广轮播）",
+            "底部导航栏 tab 右下角的小红点 / 数字角标",
             "我的 · 顶部三宫格左",
             "我的 · 顶部三宫格中",
             "我的 · 顶部三宫格右",
@@ -77,7 +81,9 @@ final class Config {
             "闸门：CtaManager.showCTA 置空（保留弹窗回调，不卡界面）",
             "闸门：msp DialogHelper 的展示入口置空 + 留存判断恒 false（包名未混淆，跨版本稳）",
             "闸门：安装引导 Intent 构造返回 null（App 自身已做空判断）",
-            "按 tab 文案过滤：命中名单的项置 GONE，底栏与其余 tab 保留",
+            "在底栏「建视图」那一步移除名单外的 tab（不是先画后藏，所以切页不闪）；剩余 tab 测量时按栏宽均分",
+            "按资源 id stage_inner_listview 隐藏整块推广轮播区",
+            "闸门：COUINavigationView.setTipsViewByItemId 置空，角标根本不挂上去（不是事后隐藏）",
             "按资源 id ll_upgrade 隐藏；三项全开时整张卡一起隐藏",
             "按资源 id ll_uninstall 隐藏；三项全开时整张卡一起隐藏",
             "按资源 id ll_download_manager 隐藏；三项全开时整张卡一起隐藏",
@@ -90,7 +96,7 @@ final class Config {
 
     /** 0=广告拦截 1=界面 2=我的页面 */
     static final int[] FEATURE_CATEGORY = {
-            0, 0, 0, 0, 0, 1, 2, 2, 2, 2, 2, 2, 2, 2,
+            0, 0, 0, 0, 0, 1, 0, 1, 2, 2, 2, 2, 2, 2, 2, 2,
     };
 
     static final String[] CATEGORIES = {"广告拦截", "界面", "我的页面"};
@@ -101,7 +107,7 @@ final class Config {
      *   待更新、下载管理 = 关）。
      */
     static final boolean[] FEATURE_DEFAULT = {
-            true, true, true, true, true, true,
+            true, true, true, true, true, true, true, true,
             false, true, false, true, true, true, true, true,
     };
 
@@ -120,6 +126,10 @@ final class Config {
     static final String ID_MINE_INDIC   = "banner_indicator";
     static final String ID_MINE_VIP     = "vip_layout";
     static final String ID_MINE_LIST    = "mine_list_view";
+    /** 首页顶部整块推广轮播区（含可滑动的大图卡片）。 */
+    static final String ID_TOP_STAGE    = "stage_inner_listview";
+    /** 底栏 tab 上的角标（ViewStub，未 inflate 时不占空间）。 */
+    static final String ID_NAV_TIP      = "vs_warning_tip";
     // 「我的」页卡片是复用的通用布局（cl_content + tv_title/tv_subtitle/tv_button），
     // 运行期没有 cl_clean / cl_health 这类专属 id，只能靠标题文案或推荐卡的 id 组合识别。
     /** 通用卡片的内容容器。 */

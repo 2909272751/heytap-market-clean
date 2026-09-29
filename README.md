@@ -2,19 +2,19 @@
 
 OPPO / 欢太 **软件商店**（`com.heytap.market`）的 LSPosed 去广告模块。
 
-拦弹窗广告、筛底栏推广入口、逐项清理「我的」页的推广位。**14 项可独立开关**，
+拦弹窗广告、筛底栏推广入口、逐项清理「我的」页的推广位。**16 项可独立开关**，
 每项独立探针 + 命中计数，失效时如实上报而不是假装成功。
 
 ![License: GPL-3.0](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 ![Vector v2.2](https://img.shields.io/badge/框架-Vector%20v2.2%20(API%20102)-informational)
 ![目标版本](https://img.shields.io/badge/验证-26.5.2-9cf)
-![版本](https://img.shields.io/badge/发布-v0.5.0-success)
+![版本](https://img.shields.io/badge/发布-v0.6.0-success)
 
 ---
 
 ## 下载
 
-从 [Releases](https://github.com/2909272751/heytap-market-clean/releases) 下载 **`module-v0.5.0.apk`**。
+从 [Releases](https://github.com/2909272751/heytap-market-clean/releases) 下载 **`module-v0.6.0.apk`**。
 
 > `v0.2.0` 的标签在开发中被复用过，先后对应过两个行为不同的二进制，已标记为预发布。
 > **请用 v0.3.0。**
@@ -48,6 +48,30 @@ OPPO / 欢太 **软件商店**（`com.heytap.market`）的 LSPosed 去广告模�
 | 开关 | 对应页面 | 做法 |
 |---|---|---|
 | 底栏精简 | 底部导航栏 | **默认只保留「首页」和「我的」**，其余入口（游戏/软件/榜单等）在**底栏建视图的那一步**就被移除——不是先画出来再隐藏，所以切页时不会闪一下。保留名单可在设置页编辑 |
+| 顶部横幅推广位 | 首页顶部横向大图推广轮播 | 整块推广区隐藏，下面的应用列表自动上移 |
+| 底栏红点角标 | 底栏 tab 右下角的小红点 / 数字角标 | 拦掉「挂角标」那一步，角标**根本不会被挂上去**，不会出现先亮一下再消失 |
+
+#### 底栏为什么能做到「既不闪、又铺满」
+
+两处都是**在源头改数据**，不是在画完之后调几何：
+
+- **不闪**：在 `buildMenuView()` 这一次同步调用里就把多余的 tab 删掉，
+  早于任何 measure/layout/draw，被删的项从未被绘制过。
+- **铺满**：COUI 底栏的 `onMeasure` 是按
+  `getMenu().getVisibleItems().size()`（**菜单里的可见项数**，不是子视图个数）
+  去分宽度的：
+  `(1080 - 36×2) / n`。所以只删视图、菜单项还在的话，除数仍是 5，
+  每项照旧 202px，容器缩成 404 挤在屏幕正中间。
+  把对应菜单项 `setVisible(false)` 之后，除数变成 2，
+  COUI 自己就算出 `(1080-72) / 2 = 504`，两项正好铺满整条栏。
+
+  这里用「设不可见」而不是 `removeItemAt`：菜单项留在原位，
+  app 侧按 item id 做的切页映射不会被改坏。
+
+  也因此**完全不需要手动 `layout()`**——改尺寸会触发 `View.onSizeChanged` →
+  `requestLayout`，在父控件 `onLayout` 里改会形成永不 idle 的布局死循环
+  （`uiautomator` 会直接报 could not get idle state）。
+
 
 ### 我的页面
 
@@ -69,7 +93,7 @@ OPPO / 欢太 **软件商店**（`com.heytap.market`）的 LSPosed 去广告模�
 
 ## 怎么看效果 / 排查
 
-设置页点「**查看兼容结果**」，会列出 14 项的实时状态：
+设置页点「**查看兼容结果**」，会列出 16 项的实时状态：
 
 - `✔ 已验证拦截` — 安装期自检已确认拦截器真的吃掉了调用
 - `✓ 已生效` — 规则已装上，且确实拦到过（`hit=`）

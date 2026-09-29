@@ -71,9 +71,9 @@ public final class MainHook extends XposedModule {
     // 任何 measure/layout/draw 之前移除子视图，被删的项就永远不会被画出来。
     private static final String CLS_NAV_MENU_VIEW = "com.coui.appcompat.material.navigation.NavigationBarMenuView";
     private static final String M_NAV_BUILD_MENU = "buildMenuView";
-    /** 底栏真正运行的类（COUI 的一层薄封装）。 */
-    private static final String CLS_NAV_ITEM_MENU = "com.coui.appcompat.bottomnavigation.COUINavigationMenuView";
     private static final String CLS_NAV_VIEW = "com.coui.appcompat.bottomnavigation.COUINavigationView";
+    /** 挂角标（红点/数字）的那一步。 */
+    private static final String M_NAV_SET_TIPS = "setTipsViewByItemId";
 
     /** “开机必备”安装引导页 Intent 构造器。 */
     private static final String CLS_BOOT_GUIDE = "a.a.a.ue8";
@@ -90,6 +90,8 @@ public final class MainHook extends XposedModule {
     private static final int I_MSP = Config.indexOf(Config.F_MSP_AD);
     private static final int I_BOOT = Config.indexOf(Config.F_BOOT_GUIDE);
     private static final int I_BOTTOM = Config.indexOf(Config.F_BOTTOM_BAR);
+    private static final int I_TOPBANNER = Config.indexOf(Config.F_TOP_BANNER);
+    private static final int I_BADGE = Config.indexOf(Config.F_NAV_BADGE);
     private static final int I_UPGRADE = Config.indexOf(Config.F_MINE_UPGRADE);
     private static final int I_UNINSTALL = Config.indexOf(Config.F_MINE_UNINSTALL);
     private static final int I_DOWNLOAD = Config.indexOf(Config.F_MINE_DOWNLOAD);
@@ -522,6 +524,13 @@ public final class MainHook extends XposedModule {
                 report("complete", Config.F_BOTTOM_BAR, "miss", "buildMenuView 不可用：" + describe(error));
             }
         }
+        if (ON[I_BADGE]) {
+            try { installNavBadgeGate(loader); }
+            catch (Throwable error) {
+                log(Log.WARN, TAG, "nav badge gate unavailable", error);
+                report("complete", Config.F_NAV_BADGE, "miss", "setTipsViewByItemId 不可用：" + describe(error));
+            }
+        }
         probe(Config.F_BOOT_GUIDE, ON[I_BOOT], new ThrowingRunnable() {
             @Override public void run() throws Exception { installBootGuideGate(loader); }
         });
@@ -531,6 +540,7 @@ public final class MainHook extends XposedModule {
         // 底栏的状态由上面的 installBottomBarPrune 决定（资源 id 在不在已经不重要，
         // 只要能拿到 tab 文案就能筛）；这里只保留资源 id 解析作为补充信息。
         probeUi(Config.F_BOTTOM_BAR, K_BOTTOM_NAV, K_TAB_LABEL_LARGE, K_TAB_LABEL_SMALL);
+        probeUi(Config.F_TOP_BANNER, K_TOP_STAGE);
 
         probeUi(Config.F_MINE_UPGRADE, K_MINE_UPGRADE);
         probeUi(Config.F_MINE_UNINSTALL, K_MINE_UNINSTALL);
@@ -926,8 +936,9 @@ public final class MainHook extends XposedModule {
     // ══════════════════════ 界面规则 ══════════════════════
 
     private static boolean anyUiRule() {
-        return ON[I_BOTTOM] || ON[I_FLOAT] || ON[I_UPGRADE] || ON[I_UNINSTALL] || ON[I_DOWNLOAD]
-                || ON[I_CLEAN] || ON[I_HEALTH] || ON[I_BANNER] || ON[I_RECOMMEND] || ON[I_VIP];
+        return ON[I_BOTTOM] || ON[I_TOPBANNER] || ON[I_FLOAT] || ON[I_UPGRADE] || ON[I_UNINSTALL]
+                || ON[I_DOWNLOAD] || ON[I_CLEAN] || ON[I_HEALTH] || ON[I_BANNER]
+                || ON[I_RECOMMEND] || ON[I_VIP];
     }
 
     /**
@@ -1010,8 +1021,8 @@ public final class MainHook extends XposedModule {
 
         // 底栏不再在这里按文案筛：改由 buildMenuView 钩子在建视图时移除，
         // 见 installBottomBarPrune —— 延迟隐藏正是「闪一下」的成因。
-        // 这里只做一次几何归位：父控件每次布局都会把容器压回「项数×202」，
-        // 所以需要在恢复/切页之后重新均分一次。
+        // 均分不需要任何额外干预：菜单项一旦设为不可见，COUI 的 onMeasure 自然按新项数均分。
+        if (ON[I_TOPBANNER]) hide(decor, ID[K_TOP_STAGE], Config.F_TOP_BANNER);
         if (ON[I_FLOAT]) hide(decor, ID[K_FLOAT_AD], Config.F_FLOAT_AD);
 
         boolean allThree = ON[I_UPGRADE] && ON[I_UNINSTALL] && ON[I_DOWNLOAD];
@@ -1115,6 +1126,31 @@ public final class MainHook extends XposedModule {
      *
      * 倒序删除：否则前面的删除会让后面的下标前移。
      */
+    /**
+     * 从底栏里移除不在保留名单里的 tab：**菜单项设不可见 + 子视图删掉**。
+     *
+     * ── 为什么两样都要做 ──
+     * COUINavigationMenuView.onMeasure 的除数是
+     * `getMenu().getVisibleItems().size()`（菜单可见项数），不是子视图数：
+     *
+     *     int width = MeasureSpec.getSize(spec) - mDefaultPadding * 2;   // 1080-72 = 1008
+     *     int n     = getMenu().getVisibleItems().size();                  // 除数
+     *     int each  = width / (n == 0 ? 1 : n);                            // 1008/5 = 202
+     *     ...
+     *     setMeasuredDimension(子项宽度之和, mItemHeight);                  // 2×202 = 404
+     *
+     * 只删视图 → 除数还是 5 → 每项仍 202 → 容器缩成 404 挤在屏幕中间；
+     * 只设不可见 → 子视图还在 → 仍然画出来。
+     * 两件都做，COUI 自己就会算出 1008/2 = 504，两项正好铺满整条栏，
+     * **不需要任何布局干预**（也就不会踩到「改尺寸触发 requestLayout → 布局死循环」）。
+     *
+     * 用 setVisible(false) 而不是 removeItemAt：菜单项留在原位，
+     * app 侧按 item id 做的切页映射不会被改坏。
+     *
+     * 文案从 MenuBuilder 读而不是从视图读 —— buildMenuView 那一刻 TextView
+     * 还没绑上文案（实测按视图读只能认出「首页」一项）。
+     * 倒序删除视图：否则前面的删除会让后面的下标前移。
+     */
     private static void pruneNavTabs(ViewGroup menu) {
         String keep = TAB_LABELS;
         int count;
@@ -1149,7 +1185,36 @@ public final class MainHook extends XposedModule {
             } catch (Throwable ignored) { }
         }
 
+        // 只删视图还不够：COUINavigationMenuView.onMeasure 的除数是
+        // `getMenu().getVisibleItems().size()`——**菜单里的可见项数**，不是子视图数。
+        // 视图删了、菜单项还在，除数还是 5，于是每项仍按 (1080-72)/5 = 202 算，
+        // 容器缩成 2×202 = 404 挤在屏幕正中间。
+        //
+        // 所以把对应菜单项 setVisible(false)：
+        //  - MenuBuilder.getVisibleItems() 只收 isVisible() 的项，除数随之变成 2，
+        //    COUI 自己就会算出 (1080-72)/2 = 504，两项正好铺满整条栏；
+        //  - 用「设不可见」而不是 removeItemAt，是为了让菜单项本身**留在原位**：
+        //    app 侧按下标/按 MenuItem id 做的切页映射不会被我们改动坏
+        //    （真机验证过：点「我的」确实到我的页）。
+        for (int k = 0; k < dropped; k++) {
+            hideMenuItem(builder, drop[k]);
+        }
+
         if (dropped > 0 || seen.length() > 0) reportTabsOnce(seen.toString(), dropped, kept);
+    }
+
+    /** 把第 index 个菜单项设为不可见；拿不到就跳过（视图已经删了，只是排版不均分）。 */
+    private static void hideMenuItem(Object builder, int index) {
+        try {
+            if (builder == null) return;
+            Object item = M_NAV_MENUITEM.invoke(builder, index);
+            if (item == null) return;
+            if (M_ITEM_VISIBLE == null) {
+                M_ITEM_VISIBLE = item.getClass().getMethod("setVisible", boolean.class);
+                M_ITEM_VISIBLE.setAccessible(true);
+            }
+            M_ITEM_VISIBLE.invoke(item, Boolean.FALSE);
+        } catch (Throwable ignored) { }
     }
 
 
@@ -1157,6 +1222,7 @@ public final class MainHook extends XposedModule {
     private static volatile Method M_NAV_MENUSIZE;
     private static volatile Method M_NAV_MENUITEM;
     private static volatile Method M_ITEM_TITLE;
+    private static volatile Method M_ITEM_VISIBLE;
     private static volatile Object NAV_BUILDER;
 
     /**
@@ -1182,28 +1248,47 @@ public final class MainHook extends XposedModule {
         } catch (Throwable ignored) { return null; }
     }
 
-    /** 沿类链往上找第一个同名方法（getDeclaredMethod 只看本类，继承来的会漏）。 */
 
     /**
-     * 让底栏剩余的 tab 均分整条栏。
+     * 底栏红点/数字角标：闸门式拦掉「挂角标」那一步。
      *
-     * ── 定位过程（都是实测，不是推测）──
-     *  - 删掉 3 项后容器缩成 `338..742`（404 宽），两项挤在屏幕正中间，两侧大片留白；
-     *  - 干预测量规格没用：在 onMeasure 里打点发现
-     *    `specSize=1080 parentW=1080 selfW=1080`——菜单视图**已经测到满宽**了，
-     *    说明它不是自己算窄的，是父控件把它摆成了 404 宽的居中盒子；
-     *  - COUI 底栏是「每项固定约 202px、容器宽 = 项数 × 202」
-     *    （实测 5 项 1008 宽、2 项 404 宽），改子项 LayoutParams 也会被父控件
-     *    重新测回 202，无效。
+     * 角标由 COUINavigationView.setTipsViewByItemId(itemId, …) 挂到 tab 上
+     * （真机视图树里是 tab 内的 app:id/vs_warning_tip，一个 ViewStub，
+     *  截图上就是「我的」右上角那个 130）。
      *
-     * 所以正确的挂点是父控件的 onLayout：让它照常排完，再把菜单视图和它的直接
-     * 子项 layout 成均分。挂在这里还顺带保证了「下一轮布局不会把我们改回去」。
+     * 这里直接不往下走，角标**根本不会被挂上去**——比事后 findViewById 再隐藏干净，
+     * 也不会出现「先亮一下再消失」。
      *
-     * 开销：只在底栏布局时触发，不是每帧路径；intercept 内只有一次类名比较，
-     * 绝大多数调用直接 proceed()。
+     * 拦的是全部 `setTipsView*`，不只 setTipsViewByItemId：真机上后者并不是唯一入口，
+     * 还有一个直接收 item 视图的 setTipsView(itemView, text, ...)。
+     * 角标通常要等登录态/消息数异步回来才设置，所以「这一轮没调用」不等于用不上——
+     * 两个入口一起封，才不会换个路径又冒出来。一个都没拦到就当没装上，不留半吊子。
      */
+    private void installNavBadgeGate(ClassLoader loader) throws Exception {
+        Class<?> owner = load(loader, CLS_NAV_VIEW);
+        int hooked = 0;
+        for (Method m : owner.getMethods()) {
+            if (!m.getName().startsWith(M_NAV_SET_TIPS)) continue;
+            if (m.getReturnType() != void.class) continue;
+            m.setAccessible(true);
+            final String label = m.getName() + "/" + m.getParameterTypes().length;
+            hook(m).setId(Config.MODULE + "_nav_badge").intercept(new XposedInterface.Hooker() {
+                @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    hit(Config.F_NAV_BADGE);
+                    return null;      // 不 proceed：角标不挂上去
+                }
+            });
+            recordAnchor(Config.F_NAV_BADGE + "/" + label, m);
+            hooked++;
+        }
+        if (hooked == 0) {
+            throw new NoSuchMethodException(owner.getName() + "." + M_NAV_SET_TIPS + "*(...)");
+        }
+        log(Log.INFO, TAG, "nav badge gate: blocked " + hooked + " setTipsView* method(s)");
+    }
 
 
+    /** 沿类链往上找方法（getDeclaredMethod 只看本类，继承来的会漏）。 */
     private static Method findDeclaredMethod(Class<?> type, String name, Class<?>... params) {
         for (Class<?> c = type; c != null; c = c.getSuperclass()) {
             try { return c.getDeclaredMethod(name, params); }
@@ -1621,7 +1706,9 @@ public final class MainHook extends XposedModule {
     private static final int K_MINE_REC_CARD = 15;
     private static final int K_MINE_REC_ITEM = 16;
     private static final int K_MINE_REC_RATING = 17;
-    private static final int ID_COUNT = 18;
+    private static final int K_TOP_STAGE = 18;
+    private static final int K_NAV_TIP = 19;
+    private static final int ID_COUNT = 20;
 
     private static final String[] ID_NAMES = {
             Config.ID_BOTTOM_TAB, Config.ID_BOTTOM_NAV, Config.ID_FLOAT_AD,
@@ -1631,6 +1718,7 @@ public final class MainHook extends XposedModule {
             Config.ID_TAB_LABEL_LARGE, Config.ID_TAB_LABEL_SMALL,
             Config.ID_MINE_CARD_TITLE, Config.ID_MINE_REC_CARD,
             Config.ID_MINE_REC_ITEM, Config.ID_MINE_REC_RATING,
+            Config.ID_TOP_STAGE, Config.ID_NAV_TIP,
     };
     private static final int[] ID = new int[ID_COUNT];
     private static volatile boolean idsResolved;
