@@ -17,7 +17,8 @@ final class Config {
     /**
      * 规则结构版本：只有规则语义变化时才 +1（会让锚点缓存失效重探）。
      */
-    static final String SCHEMA = "2";
+    /** 规则结构版本：规则语义变了就 +1，缓存 token 随之失效、重新探测。 */
+    static final String SCHEMA = "3";
 
     /** RemotePreferences 组名。 */
     static final String GROUP = "io.github.heytapmarketclean_settings";
@@ -26,6 +27,7 @@ final class Config {
     static final String F_FLOAT_AD       = "float_ad";        // 悬浮广告
     static final String F_AI_BUBBLE      = "ai_bubble";       // AI 搜索引导气泡
     static final String F_CTA_DIALOG     = "cta_dialog";      // 活动弹窗 CTA
+    static final String F_MSP_AD         = "msp_ad";          // msp 营销弹窗（启动/留存/提示）
     static final String F_BOOT_GUIDE     = "boot_guide";      // 开机必备引导页
     static final String F_BOTTOM_BAR     = "bottom_bar";      // 底部导航栏
     static final String F_MINE_UPGRADE   = "mine_upgrade";    // 待更新
@@ -38,14 +40,14 @@ final class Config {
     static final String F_MINE_VIP       = "mine_vip";        // 游戏 VIP 卡
 
     static final String[] FEATURES = {
-            F_FLOAT_AD, F_AI_BUBBLE, F_CTA_DIALOG, F_BOOT_GUIDE,
+            F_FLOAT_AD, F_AI_BUBBLE, F_CTA_DIALOG, F_MSP_AD, F_BOOT_GUIDE,
             F_BOTTOM_BAR,
             F_MINE_UPGRADE, F_MINE_UNINSTALL, F_MINE_DOWNLOAD,
             F_MINE_CLEAN, F_MINE_HEALTH, F_MINE_BANNER, F_MINE_RECOMMEND, F_MINE_VIP,
     };
 
     static final String[] FEATURE_LABELS = {
-            "悬浮广告", "AI 搜索引导气泡", "活动弹窗（CTA）", "开机必备引导页",
+            "悬浮广告", "AI 搜索引导气泡", "活动弹窗（CTA）", "营销弹窗（msp）", "开机必备引导页",
             "底栏推广入口",
             "待更新", "应用卸载", "下载管理",
             "存储空间清理", "应用健康状态", "热门好礼横幅", "“继续探索”推荐卡", "游戏 VIP 卡",
@@ -56,6 +58,7 @@ final class Config {
             "任意页右下角悬浮图标",
             "首页顶部搜索栏的 AI 图标气泡",
             "任意页弹出的活动/广告弹窗",
+            "冷启动与切页时弹出的营销弹窗（msp SDK）",
             "冷启动后的“开机必备”全屏引导页",
             "首页底部导航栏（只隐藏推广 tab，保留切页）",
             "我的 · 顶部三宫格左",
@@ -72,6 +75,7 @@ final class Config {
             "闸门：FloatJumpPriorManager.canShow(FloatShowType) 恒 false",
             "闸门：AISearchBubbleUtil 展示方法置空（不影响 AI 搜索入口本身）",
             "闸门：CtaManager.showCTA 置空（保留弹窗回调，不卡界面）",
+            "闸门：msp DialogHelper 的展示入口置空 + 留存判断恒 false（包名未混淆，跨版本稳）",
             "闸门：安装引导 Intent 构造返回 null（App 自身已做空判断）",
             "按 tab 文案过滤：命中名单的项置 GONE，底栏与其余 tab 保留",
             "按资源 id ll_upgrade 隐藏；三项全开时整张卡一起隐藏",
@@ -86,7 +90,7 @@ final class Config {
 
     /** 0=广告拦截 1=界面 2=我的页面 */
     static final int[] FEATURE_CATEGORY = {
-            0, 0, 0, 0, 1, 2, 2, 2, 2, 2, 2, 2, 2,
+            0, 0, 0, 0, 0, 1, 2, 2, 2, 2, 2, 2, 2, 2,
     };
 
     static final String[] CATEGORIES = {"广告拦截", "界面", "我的页面"};
@@ -97,7 +101,7 @@ final class Config {
      *   待更新、下载管理 = 关）。
      */
     static final boolean[] FEATURE_DEFAULT = {
-            true, true, true, true, true,
+            true, true, true, true, true, true,
             false, true, false, true, true, true, true, true,
     };
 

@@ -51,6 +51,20 @@ public final class MainHook extends XposedModule {
     private static final String CLS_CTA = "a.a.a.hg3";
     private static final String M_CTA_SHOW = "showCTA";
 
+    // ── msp 营销弹窗（用户反馈「打开软件会弹窗」的拦截面）────────────────
+    // msp = 营销服务平台，是 App 自带的广告/营销 SDK，「打开时弹出的那个窗」就出自这里。
+    // 它的包名**没有混淆**（发布过的 SDK），所以这是整个 App 里最稳的锚点之一，
+    // 比 a.a.a.* 那些混淆名可靠得多——正好落在「多版本自适配」要的地方。
+    //
+    // dex 实测：com.heytap.msp.sdk.common.dialog.DialogHelper 是弹窗调度中枢，
+    // create/show/dismiss 一整套；广告弹窗体是 CommonDialog，三个构造器全是
+    // (Activity, 图片地址, 文案, 跳转链接, ..., 回调) —— 典型广告素材。
+    private static final String CLS_MSP_HELPER   = "com.heytap.msp.sdk.common.dialog.DialogHelper";
+    private static final String M_MSP_SHOW_AD    = "showDownloadDialog";
+    private static final String M_MSP_NEED_KEEP = "needShowRetentionDialog";
+    private static final String M_MSP_SHOW_TIPS = "showTipsDialog";
+    private static final String M_MSP_SHOW_KEEP = "showRetentionTipDialog";
+
     /** “开机必备”安装引导页 Intent 构造器。 */
     private static final String CLS_BOOT_GUIDE = "a.a.a.ue8";
     private static final String M_GUIDE_INTENT = "\u0528";
@@ -63,6 +77,7 @@ public final class MainHook extends XposedModule {
     private static final int I_FLOAT = Config.indexOf(Config.F_FLOAT_AD);
     private static final int I_AIBUBBLE = Config.indexOf(Config.F_AI_BUBBLE);
     private static final int I_CTA = Config.indexOf(Config.F_CTA_DIALOG);
+    private static final int I_MSP = Config.indexOf(Config.F_MSP_AD);
     private static final int I_BOOT = Config.indexOf(Config.F_BOOT_GUIDE);
     private static final int I_BOTTOM = Config.indexOf(Config.F_BOTTOM_BAR);
     private static final int I_UPGRADE = Config.indexOf(Config.F_MINE_UPGRADE);
@@ -78,12 +93,21 @@ public final class MainHook extends XposedModule {
     /**
      * 补隐藏的时间点。
      *
-     * 原来排了 {0, 600, 2000, 5000, 12000} 五个点反复补跑，用户反馈「点一下闪一下」——
-     * 原因是列表重新绑定后卡片先以可见状态出现，要等到下一个延迟点才被再次隐藏，
-     * 于是每点一次就闪一次。子项重新挂载已经由层级守卫确定性处理，
-     * 所以这里只保留最早的几个点覆盖异步数据到达，长尾一律去掉。
+     * 用户反馈「点击底栏切换时隐藏的单元又出来」的根因就是这个窗口太短：
+     * 切 tab 会触发 ViewPager.setCurrentItem（已确认挂上，日志有
+     * `ui triggers installed: onResume + 2 pager method(s)`），但「我的」页的
+     * 推广位是**异步**下发的，重渲染常发生在 1.5 秒之后，原来的
+     * {0, 600, 2000, 5000, 12000} 最后一次在 12s，中间的空档就露出来了。
+     *
+     * 这里改成一条覆盖整个重渲染周期、且**有界**的补跑序列：
+     * 起点密集（抢在内容到达前），尾部拉长到 5s 收口，之后不再跑——
+     * 不是常驻轮询，只是「用户刚切了一下页」之后的有限几次。
+     *
+     * 上一版因为怕闪烁把长尾全删了，那是过度反应：闪烁的成因是
+     * **先显示后隐藏**，而这里所有隐藏函数只设 GONE、从不把视图设回 VISIBLE，
+     * 所以多跑几轮只可能「藏得更多」，结构上不可能造成「闪一下又出现」。
      */
-    private static final long[] APPLY_DELAYS = {0L, 400L, 1500L};
+    private static final long[] APPLY_DELAYS = {0L, 200L, 600L, 1500L, 3000L, 5000L};
 
     private String processName;
 
@@ -478,6 +502,9 @@ public final class MainHook extends XposedModule {
         probe(Config.F_CTA_DIALOG, ON[I_CTA], new ThrowingRunnable() {
             @Override public void run() throws Exception { installCtaGate(loader); }
         });
+        probe(Config.F_MSP_AD, ON[I_MSP], new ThrowingRunnable() {
+            @Override public void run() throws Exception { installMspAdGate(loader); }
+        });
         probe(Config.F_BOOT_GUIDE, ON[I_BOOT], new ThrowingRunnable() {
             @Override public void run() throws Exception { installBootGuideGate(loader); }
         });
@@ -554,6 +581,102 @@ public final class MainHook extends XposedModule {
         recordAnchor(Config.F_CTA_DIALOG, show);
     }
 
+    /**
+     * msp 营销弹窗闸门。
+     *
+     * 用户反馈「有时候打开软件会出现一个弹窗」。这类广告是**服务端触发、带频控**的，
+     * 在开发机上往往一条都不弹，等它偶发来定位不现实。改成从 DEX 把弹窗面一次摸清：
+     * 穷举所有 Dialog/PopupWindow 子类（共 20 个 App 自有类），再按归属筛——
+     * 落在 com.heytap.msp 下的就是营销 SDK 的弹窗面。
+     *
+     * 这里拦的是**决策点**而不是 Dialog.show()：show() 是所有 App 共用的框架方法，
+     * 在它上面挂钩会波及正常弹窗（协议、确认框、支付），代价太大。
+     * 而 DialogHelper 是 msp 私有的，拦它只影响营销弹窗。
+     *
+     * 四个方法分两类：
+     *  - 展示入口（void）：置空，广告不弹
+     *  - 留存判断（boolean）：恒 false，让 SDK 自己就不打算弹
+     * 两条都拦是有意的冗余：不同版本走的可能是不同那条。
+     *
+     * 全部 private 方法，Xposed 可以挂；但每个都单独 try，一个挂不上不影响其余。
+     */
+    private void installMspAdGate(ClassLoader loader) throws Exception {
+        Class<?> owner = load(loader, CLS_MSP_HELPER);
+        int hooked = 0;
+
+        // 展示入口：置空。Request 形参一律不碰，碰了可能触发空指针。
+        String[] voids = {M_MSP_SHOW_AD, M_MSP_SHOW_TIPS, M_MSP_SHOW_KEEP};
+        for (final String label : voids) {
+            try {
+                Method m = findByNameReturn(owner, label, "void");
+                if (m == null) throw new NoSuchMethodException(owner.getName() + "." + label + "() -> void");
+                hook(m).setId(Config.MODULE + "_msp_" + label).intercept(new XposedInterface.Hooker() {
+                    @Override public Object intercept(XposedInterface.Chain chain) {
+                        hit(Config.F_MSP_AD);
+                        return null;
+                    }
+                });
+                log(Log.INFO, TAG, "hooked: msp " + label + " " + m);
+                recordAnchor(Config.F_MSP_AD + "/" + label, m);
+                hooked++;
+            } catch (Throwable error) {
+                // 单个方法挂不上不算失败：不同版本可能只走其中一条
+                log(Log.WARN, TAG, "msp gate skipped " + label, error);
+            }
+        }
+
+        // 留存弹窗的判断：恒 false
+        try {
+            Method need = findByNameReturn(owner, M_MSP_NEED_KEEP, "boolean");
+            if (need == null) throw new NoSuchMethodException(owner.getName() + "." + M_MSP_NEED_KEEP + "() -> boolean");
+            hook(need).setId(Config.MODULE + "_msp_need_retention").intercept(new XposedInterface.Hooker() {
+                @Override public Object intercept(XposedInterface.Chain chain) {
+                    hit(Config.F_MSP_AD);
+                    return Boolean.FALSE;
+                }
+            });
+            log(Log.INFO, TAG, "hooked: msp " + M_MSP_NEED_KEEP + " " + need);
+            recordAnchor(Config.F_MSP_AD + "/" + M_MSP_NEED_KEEP, need);
+            hooked++;
+        } catch (Throwable error) {
+            log(Log.WARN, TAG, "msp gate skipped " + M_MSP_NEED_KEEP, error);
+        }
+
+        if (hooked == 0) throw new NoSuchMethodException("no msp dialog gate found in " + CLS_MSP_HELPER);
+    }
+
+    /**
+     * 按「名字 + 返回类型」找方法，不校验形参。
+     *
+     * msp 这几个方法在版本之间形参会变（showDownloadDialog 的 Request 版本迭代过），
+     * 所以这里只锚死名字和返回类型，形参个数交给调用方按需填 null。
+     * 找不到返回 null（而不是抛异常），让调用方自己决定要不要跳过——闸门是冗余的，
+     * 少一个不致命。
+     */
+    private static Method findByNameReturn(Class<?> owner, String name, String ret) throws Exception {
+        for (Method m : owner.getDeclaredMethods()) {
+            if (!name.equals(m.getName())) continue;
+            if (ret != null && !"void".equals(ret) && !m.getReturnType().getName().equals(ret)) continue;
+            if ("void".equals(ret) && m.getReturnType() != void.class) continue;
+            m.setAccessible(true);
+            return m;
+        }
+        return null;
+    }
+
+    /** 基本类型形参的零值，避免反射调用时自动装箱抛 IllegalArgumentException。 */
+    private static Object defaultPrimitive(Class<?> type) {
+        if (type == boolean.class) return Boolean.FALSE;
+        if (type == int.class) return Integer.valueOf(0);
+        if (type == long.class) return Long.valueOf(0L);
+        if (type == float.class) return Float.valueOf(0f);
+        if (type == double.class) return Double.valueOf(0d);
+        if (type == short.class) return Short.valueOf((short) 0);
+        if (type == byte.class) return Byte.valueOf((byte) 0);
+        if (type == char.class) return Character.valueOf('\0');
+        return null;
+    }
+
     /** 开机必备引导页：Intent 构造返回 null —— 唯一调用方 c4b.Ԩ 本来就判空。 */
     private void installBootGuideGate(ClassLoader loader) throws Exception {
         Class<?> owner = load(loader, CLS_BOOT_GUIDE);
@@ -583,7 +706,7 @@ public final class MainHook extends XposedModule {
      * 不会触发任何真实广告逻辑。
      */
     private void selfTestAdGates(ClassLoader loader, Context context) {
-        if (!ON[I_FLOAT] && !ON[I_AIBUBBLE] && !ON[I_CTA] && !ON[I_BOOT]) return;
+        if (!ON[I_FLOAT] && !ON[I_AIBUBBLE] && !ON[I_CTA] && !ON[I_MSP] && !ON[I_BOOT]) return;
         selfTest = true;
         try {
             // 1) 浮窗广告：构造 qx5 再问它能不能展示
@@ -634,6 +757,30 @@ public final class MainHook extends XposedModule {
                     if (result != null) note("selftest boot_guide UNEXPECTED non-null Intent");
                 } catch (Throwable error) { note("selftest boot_guide skipped: " + describe(error)); }
             }
+            // 4) msp 营销弹窗：留存判断是 instance 方法，需要先造一个 DialogHelper。
+            //    showDownloadDialog(Request) 只用 null 试——拦截器在碰形参之前就返回了，
+            //    不会真的去解析这个 Request，所以传 null 是安全的。
+            if (ON[I_MSP]) {
+                try {
+                    Class<?> owner = load(loader, CLS_MSP_HELPER);
+                    Object instance = allocateInstance(owner);
+                    if (instance != null) {
+                        Method need = findByNameReturn(owner, M_MSP_NEED_KEEP, "boolean");
+                        if (need != null) {
+                            Object result = need.invoke(instance, emptyArgs(need));
+                            if (!Boolean.FALSE.equals(result)) {
+                                note("selftest msp_ad UNEXPECTED " + M_MSP_NEED_KEEP + "=" + result);
+                            }
+                        }
+                        Method showAd = findByNameReturn(owner, M_MSP_SHOW_AD, "void");
+                        if (showAd != null) {
+                            // 形参一律传 null：拦截器在碰形参之前就返回了，
+                            // 不会真的去解析这个 Request，所以自检不会触发任何真实广告逻辑
+                            showAd.invoke(instance, emptyArgs(showAd));
+                        }
+                    }
+                } catch (Throwable error) { note("selftest msp_ad skipped: " + describe(error)); }
+            }
         } finally {
             selfTest = false;
         }
@@ -665,6 +812,71 @@ public final class MainHook extends XposedModule {
         java.lang.reflect.Constructor<?> ctor = owner.getDeclaredConstructor();
         ctor.setAccessible(true);
         return ctor.newInstance();
+    }
+
+    /**
+     * 用「形参最少」的那个构造造一个实例，形参一律填零值/null。
+     *
+     * 自检专用：msp 的 DialogHelper 只有 (Context, Activity, BizAgentImpl, String)
+     * 这一个构造，没有无参版本，newInstance() 会直接 NoSuchMethodException。
+     * 传 null 是安全的——自检只调被拦下的方法，拦截器在碰形参之前就返回了，
+     * 构造体里读到的 null 不会被真正使用。
+     */
+    private static Object newInstanceAny(Class<?> owner) throws Exception {
+        java.lang.reflect.Constructor<?>[] all = owner.getDeclaredConstructors();
+        if (all.length == 0) throw new NoSuchMethodException(owner.getName() + " has no constructor");
+        java.lang.reflect.Constructor<?> best = all[0];
+        for (java.lang.reflect.Constructor<?> c : all) {
+            if (c.getParameterTypes().length < best.getParameterTypes().length) best = c;
+        }
+        best.setAccessible(true);
+        return best.newInstance(emptyArgs(best));
+    }
+
+    /**
+     * 自检专用的造实例方式：Unsafe.allocateInstance，**完全跳过构造器**。
+     *
+     * 为什么不能用 newInstanceAny：msp 的 DialogHelper 构造器是
+     * (Context, Activity, BizAgentImpl, String)，传 null 进构造体第一步就 NPE，
+     * 自检直接 InvocationTargetException，什么都验不到。
+     *
+     * allocateInstance 出来的实例字段全是 null/0，正好符合自检需要：
+     * 只调被拦下的方法，拦截器在碰 this 之前就 return 了，字段为 null 根本走不到；
+     * 而不跑构造器就不会被构造体里的 NPE 绊倒。Unsafe 不可用时退回 newInstanceAny。
+     */
+    private static Object allocateInstance(Class<?> owner) throws Exception {
+        if (UNSAFE != null) {
+            try {
+                Method alloc = UNSAFE.getClass().getMethod("allocateInstance", Class.class);
+                Object instance = alloc.invoke(UNSAFE, owner);
+                if (instance != null) return instance;
+            } catch (Throwable error) {
+                noteStatic("selftest: Unsafe.allocateInstance unavailable (" + describe(error) + ")");
+            }
+        }
+        return newInstanceAny(owner);
+    }
+
+    /** sun.misc.Unsafe.theUnsafe，只在安装期取一次，intercept 内不使用。 */
+    private static final Object UNSAFE = resolveUnsafe();
+
+    private static Object resolveUnsafe() {
+        try {
+            Class<?> unsafe = Class.forName("sun.misc.Unsafe");
+            java.lang.reflect.Field field = unsafe.getDeclaredField("theUnsafe");
+            field.setAccessible(true);
+            return field.get(null);
+        } catch (Throwable ignored) { return null; }
+    }
+
+    /** 形参占位：一律 null/零值。仅用于自检造实例与调用被拦下的方法。 */
+    private static Object[] emptyArgs(java.lang.reflect.Executable m) {
+        Class<?>[] params = m.getParameterTypes();
+        Object[] args = new Object[params.length];
+        for (int i = 0; i < params.length; i++) {
+            args[i] = params[i].isPrimitive() ? defaultPrimitive(params[i]) : null;
+        }
+        return args;
     }
 
     /** 异常文本：自检跳过的原因要能直接读懂。 */

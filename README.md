@@ -2,19 +2,19 @@
 
 OPPO / 欢太 **软件商店**（`com.heytap.market`）的 LSPosed 去广告模块。
 
-拦弹窗广告、筛底栏推广入口、逐项清理「我的」页的推广位。**13 项可独立开关**，
+拦弹窗广告、筛底栏推广入口、逐项清理「我的」页的推广位。**14 项可独立开关**，
 每项独立探针 + 命中计数，失效时如实上报而不是假装成功。
 
 ![License: GPL-3.0](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 ![Vector v2.2](https://img.shields.io/badge/框架-Vector%20v2.2%20(API%20102)-informational)
 ![目标版本](https://img.shields.io/badge/验证-26.5.2-9cf)
-![版本](https://img.shields.io/badge/发布-v0.3.0-success)
+![版本](https://img.shields.io/badge/发布-v0.4.0-success)
 
 ---
 
 ## 下载
 
-从 [Releases](https://github.com/2909272751/heytap-market-clean/releases) 下载 **`module-v0.3.0.apk`**。
+从 [Releases](https://github.com/2909272751/heytap-market-clean/releases) 下载 **`module-v0.4.0.apk`**。
 
 > `v0.2.0` 的标签在开发中被复用过，先后对应过两个行为不同的二进制，已标记为预发布。
 > **请用 v0.3.0。**
@@ -40,6 +40,7 @@ OPPO / 欢太 **软件商店**（`com.heytap.market`）的 LSPosed 去广告模�
 | 悬浮广告 | 任意页右下角悬浮图标 | 让「是否展示」的判断恒为否 |
 | AI 搜索引导气泡 | 首页顶部搜索栏的 AI 图标 | 只置空气泡展示，**AI 搜索入口本身保留可用** |
 | 活动弹窗（CTA） | 任意页弹出的活动弹窗 | 置空展示调用，回调一概不碰（避免卡住弹窗流程） |
+| 营销弹窗（msp） | 冷启动与切页时弹出的营销弹窗 | 拦 msp 营销 SDK 的弹窗调度中枢（展示入口置空 + 留存判断恒否），**不碰 `Dialog.show()`**，所以协议、支付、确认框这些正常弹窗不受影响 |
 | 开机必备引导页 | 冷启动后的全屏引导页 | 引导 Intent 构造返回 null |
 
 ### 界面
@@ -68,7 +69,7 @@ OPPO / 欢太 **软件商店**（`com.heytap.market`）的 LSPosed 去广告模�
 
 ## 怎么看效果 / 排查
 
-设置页点「**查看兼容结果**」，会列出 13 项的实时状态：
+设置页点「**查看兼容结果**」，会列出 14 项的实时状态：
 
 - `✔ 已验证拦截` — 安装期自检已确认拦截器真的吃掉了调用
 - `✓ 已生效` — 规则已装上，且确实拦到过（`hit=`）
