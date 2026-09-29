@@ -18,7 +18,7 @@ final class Config {
      * 规则结构版本：只有规则语义变化时才 +1（会让锚点缓存失效重探）。
      */
     /** 规则结构版本：规则语义变了就 +1，缓存 token 随之失效、重新探测。 */
-    static final String SCHEMA = "3";
+    static final String SCHEMA = "4";
 
     /** RemotePreferences 组名。 */
     static final String GROUP = "io.github.heytapmarketclean_settings";
@@ -147,11 +147,20 @@ final class Config {
     static final String ID_TAB_LABEL_SMALL = "navigation_bar_item_small_label_view";
 
     /**
-     * 底栏默认隐藏名单：只含推广性质的 tab，首页/游戏/分类/我的 等主入口一律保留，
-     * 否则用户将无法切换页面（这是整条隐藏底栏最大的代价）。
+     * 底栏名单。
+     *
+     * v0.4.0 之前这里是「隐藏名单」（默认 福利,活动,签到,福利中心），靠设 GONE 藏 tab。
+     * v0.4.0 起改成**保留名单**：只留用户明确要的几项，其余从源头不再建视图。
+     *
+     * 为什么不继续用隐藏名单：COUINavigationMenuView 的布局是按
+     * 「子视图序号 i × (宽度 / itemCount)」排的，itemCount 取自适配器。
+     * 只把子视图设成 GONE 而不动 itemCount，被藏的项仍然占着槽位，
+     * 于是界面上留下等宽的空洞——这就是之前「太丑」的真正原因。
+     * 从 buildMenuView 之后移除子视图 + 让计数跟着变，才是干净的均分。
+     *
      * 取值是 tab 文案，可由设置页覆盖。
      */
-    static final String DEFAULT_TAB_LABELS = "福利,活动,签到,福利中心";
+    static final String DEFAULT_TAB_LABELS = "首页,我的";
 
     /** 底栏隐藏名单的设置键。 */
     static final String KEY_TAB_LABELS = "bottom_bar_labels";

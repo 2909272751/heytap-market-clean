@@ -65,6 +65,16 @@ public final class MainHook extends XposedModule {
     private static final String M_MSP_SHOW_TIPS = "showTipsDialog";
     private static final String M_MSP_SHOW_KEEP = "showRetentionTipDialog";
 
+    // ── 底栏：从「建视图」那一步减员，而不是事后把视图设成 GONE ──────────
+    // COUI 的底栏控件是非混淆包名（ColorOS UI Kit），锚点跨版本稳定。
+    // buildMenuView() 正是「先按列表建视图」的那一步——在这一步之后、
+    // 任何 measure/layout/draw 之前移除子视图，被删的项就永远不会被画出来。
+    private static final String CLS_NAV_MENU_VIEW = "com.coui.appcompat.material.navigation.NavigationBarMenuView";
+    private static final String M_NAV_BUILD_MENU = "buildMenuView";
+    /** 底栏真正运行的类（COUI 的一层薄封装）。 */
+    private static final String CLS_NAV_ITEM_MENU = "com.coui.appcompat.bottomnavigation.COUINavigationMenuView";
+    private static final String CLS_NAV_VIEW = "com.coui.appcompat.bottomnavigation.COUINavigationView";
+
     /** “开机必备”安装引导页 Intent 构造器。 */
     private static final String CLS_BOOT_GUIDE = "a.a.a.ue8";
     private static final String M_GUIDE_INTENT = "\u0528";
@@ -505,13 +515,23 @@ public final class MainHook extends XposedModule {
         probe(Config.F_MSP_AD, ON[I_MSP], new ThrowingRunnable() {
             @Override public void run() throws Exception { installMspAdGate(loader); }
         });
+        if (ON[I_BOTTOM]) {
+            try { installBottomBarPrune(loader); }
+            catch (Throwable error) {
+                log(Log.WARN, TAG, "bottom bar prune unavailable", error);
+                report("complete", Config.F_BOTTOM_BAR, "miss", "buildMenuView 不可用：" + describe(error));
+            }
+        }
         probe(Config.F_BOOT_GUIDE, ON[I_BOOT], new ThrowingRunnable() {
             @Override public void run() throws Exception { installBootGuideGate(loader); }
         });
 
         // UI 类规则：按资源 id / 结构隐藏，统一由 onResume + 切页事件驱动。
         // 它们的匹配结果由资源 id 解析情况决定（miss / partial / matched 都如实上报）。
+        // 底栏的状态由上面的 installBottomBarPrune 决定（资源 id 在不在已经不重要，
+        // 只要能拿到 tab 文案就能筛）；这里只保留资源 id 解析作为补充信息。
         probeUi(Config.F_BOTTOM_BAR, K_BOTTOM_NAV, K_TAB_LABEL_LARGE, K_TAB_LABEL_SMALL);
+
         probeUi(Config.F_MINE_UPGRADE, K_MINE_UPGRADE);
         probeUi(Config.F_MINE_UNINSTALL, K_MINE_UNINSTALL);
         probeUi(Config.F_MINE_DOWNLOAD, K_MINE_DOWNLOAD);
@@ -988,7 +1008,10 @@ public final class MainHook extends XposedModule {
         catch (Throwable ignored) { return; }
         if (decor == null) return;
 
-        if (ON[I_BOTTOM]) filterBottomTabs(decor);
+        // 底栏不再在这里按文案筛：改由 buildMenuView 钩子在建视图时移除，
+        // 见 installBottomBarPrune —— 延迟隐藏正是「闪一下」的成因。
+        // 这里只做一次几何归位：父控件每次布局都会把容器压回「项数×202」，
+        // 所以需要在恢复/切页之后重新均分一次。
         if (ON[I_FLOAT]) hide(decor, ID[K_FLOAT_AD], Config.F_FLOAT_AD);
 
         boolean allThree = ON[I_UPGRADE] && ON[I_UNINSTALL] && ON[I_DOWNLOAD];
@@ -1038,62 +1061,173 @@ public final class MainHook extends XposedModule {
         }
     }
 
-    /** 底栏推广项的文案过滤名单；设置页可改，configure 时从 RemotePreferences 读入。 */
+    /** 底栏保留名单；设置页可改，configure 时从 RemotePreferences 读入。 */
     private static volatile String TAB_LABELS = Config.DEFAULT_TAB_LABELS;
 
     /**
-     * 底栏：只隐藏推广类 tab，保留正常入口与切页能力。
+     * 底栏：只保留名单里的 tab，其余从源头不建视图。
      *
-     * 为什么按「文案」而不是按 id/下标：
-     *  - 文案（语义标签）是跨混淆、跨版本最稳的锚点，参考项目就是靠语义标签过滤 tab 快照；
-     *  - id 在每个 tab 项里是同一套（fl_root/navigation_bar_item_*），无法区分是哪一个 tab；
-     *  - 下标会随服务端下发顺序变化。
-     * 整条隐藏底栏会让用户无法切到「我的」等页面，代价大于收益，所以只筛掉推广项。
+     * ── 上一版为什么「丑」而且会闪 ──
+     * 做法是拿到底栏后按文案把不要的子视图 setVisibility(GONE)。两个问题：
+     *  1) 布局不匀：COUINavigationMenuView 的排布是「子视图序号 i × (宽度 / itemCount)」，
+     *     itemCount 来自适配器（= 菜单项数）。只设 GONE 不动 itemCount，
+     *     被藏的项照样占着槽位，于是界面上留下等宽的空洞。
+     *  2) 会闪：补隐藏是延迟触发的，切页后要先渲染一帧完整底栏，
+     *     下一轮定时器才把 GONE 设上——用户看到的就是「先出现、再消失」。
+     *     更糟的是恢复逻辑里有一句 setVisibility(VISIBLE)，
+     *     每次补跑都会把该显示的项先点亮再藏一次。
      *
-     * 隐藏名单走设置页（GROUP 里的 bottom_bar_labels，默认见 Config.DEFAULT_TAB_LABELS）。
-     * 每次只对 COUINavigationMenuView 的直接子项操作，不做整树遍历。
+     * ── 这一版怎么做 ──
+     * 拦的是 NavigationBarMenuView.buildMenuView()：**「先按列表建视图」那一步**。
+     * proceed() 让它照常建完，随后在同一个同步调用里把不要的子视图 removeViewAt 掉。
+     * 这一切发生在任何 measure / layout / draw 之前，所以：
+     *  - 不会被画出来 → 不会闪
+     *  - 子视图数真的变成 2 → itemCount 跟着变小 → 两项各占一半，没有空洞
+     * 全程不碰 setVisibility，也就从根上没有了「先点亮再熄灭」。
+     *
+     * 触发时机只有底栏自身重建（冷启动 / 恢复 / 切主题），频率极低。
+     * 绝不做定时轮询，也不遍历整棵视图树：只操作 menu 的直接子项。
      */
-    private static void filterBottomTabs(View decor) {
-        if (ID[K_BOTTOM_NAV] == 0) return;
-        View nav;
-        try { nav = decor.findViewById(ID[K_BOTTOM_NAV]); }
-        catch (Throwable ignored) { return; }
-        if (!(nav instanceof ViewGroup)) return;
-        ViewGroup menu = null;
-        try {
-            // COUINavigationView 内部的列表容器没有资源 id，按类名在直接子项里找
-            for (int i = 0; i < ((ViewGroup) nav).getChildCount(); i++) {
-                View child = ((ViewGroup) nav).getChildAt(i);
-                if (child != null && child.getClass().getName().endsWith("NavigationMenuView")) {
-                    menu = (ViewGroup) child; break;
-                }
+    private void installBottomBarPrune(ClassLoader loader) throws Exception {
+        Class<?> owner = load(loader, CLS_NAV_MENU_VIEW);
+        final Method build = requireMethod(owner, M_NAV_BUILD_MENU, "void", new String[0]);
+        hook(build).setId(Config.MODULE + "_nav_prune").intercept(new XposedInterface.Hooker() {
+            @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                Object result = chain.proceed();
+                try {
+                    Object self = chain.getThisObject();
+                    if (self instanceof ViewGroup) pruneNavTabs((ViewGroup) self);
+                } catch (Throwable ignored) { }
+                return result;
             }
-        } catch (Throwable ignored) { }
-        if (menu == null) return;
+        });
+        log(Log.INFO, TAG, "hooked: bottom bar prune at " + build);
+        recordAnchor(Config.F_BOTTOM_BAR, build);
+    }
 
-        String labels = TAB_LABELS;
-        int hidden = 0;
+    /**
+     * 从底栏里移除不在保留名单里的子视图。
+     *
+     * 文案**从菜单项读，不从视图读**——buildMenuView 那一刻 TextView 的 text 还没绑定
+     * （实测只能认出「首页」，后面的项文案全空），按视图读会把「我的」这类
+     * 正常入口误当成「取不到就不动」的漏网之鱼。菜单项顺序与建出来的子视图顺序
+     * 严格一一对应，所以按同一下标取文案、再按同一下标删视图是对得上的。
+     *
+     * 倒序删除：否则前面的删除会让后面的下标前移。
+     */
+    private static void pruneNavTabs(ViewGroup menu) {
+        String keep = TAB_LABELS;
+        int count;
+        try { count = menu.getChildCount(); } catch (Throwable ignored) { return; }
+        if (count <= 0) return;
+
+        Object builder = navMenuBuilder(menu);
+        int dropped = 0;
         int kept = 0;
         StringBuilder seen = new StringBuilder();
+        int[] drop = new int[Math.min(count, 32)];
+
+        for (int i = 0; i < count; i++) {
+            View child;
+            try { child = menu.getChildAt(i); } catch (Throwable ignored) { continue; }
+            if (child == null) continue;
+            String title = navItemTitle(builder, i);
+            if (title == null) title = tabTitle(child);     // 回退：菜单读不到才看视图
+            if (title == null) continue;                    // 两处都读不到就不动，宁可漏删不误伤
+            if (seen.indexOf(title) < 0) seen.append(title).append('/');
+            if (keep.contains(title)) { kept++; continue; }
+            if (dropped < drop.length) drop[dropped++] = i;
+        }
+
+        // 缓存容器直接引用：底栏不在 Activity 的 decor 树里，
+        // 之后「恢复/切页」时只能靠它才能再找到底栏。
+
+        for (int k = dropped - 1; k >= 0; k--) {
+            try {
+                menu.removeViewAt(drop[k]);
+                hit(Config.F_BOTTOM_BAR);
+            } catch (Throwable ignored) { }
+        }
+
+        if (dropped > 0 || seen.length() > 0) reportTabsOnce(seen.toString(), dropped, kept);
+    }
+
+
+    /** 缓存下来的菜单反射句柄，只在安装后第一次用到时解析一次，之后零反射。 */
+    private static volatile Method M_NAV_MENUSIZE;
+    private static volatile Method M_NAV_MENUITEM;
+    private static volatile Method M_ITEM_TITLE;
+    private static volatile Object NAV_BUILDER;
+
+    /**
+     * 拿到底栏背后的 MenuBuilder；读不到就返回 null，后续退回按视图文案判断。
+     *
+     * getMenu() 声明在 NavigationBarMenuView（基类）上，运行期实例是它的子类
+     * COUINavigationMenuView，所以不能直接 getDeclaredMethod——必须沿类链往上找，
+     * 否则永远是 null（第一版就栽在这里，日志里 seen 只剩「首页」）。
+     */
+    private static Object navMenuBuilder(ViewGroup menu) {
+        Object cached = NAV_BUILDER;
+        if (cached != null) return cached;
         try {
-            for (int i = 0; i < menu.getChildCount(); i++) {
-                View item = menu.getChildAt(i);
-                if (item == null) continue;
-                String title = tabTitle(item);
-                if (title == null) continue;
-                if (seen.indexOf(title) < 0) seen.append(title).append('/');
-                if (labels.contains(title)) {
-                    if (item.getVisibility() != View.GONE) item.setVisibility(View.GONE);
-                    hidden++;
-                    hit(Config.F_BOTTOM_BAR);
-                } else {
-                    if (item.getVisibility() == View.GONE) item.setVisibility(View.VISIBLE);
-                    kept++;
-                }
+            Method getter = findDeclaredMethod(menu.getClass(), "getMenu");
+            if (getter == null) return null;
+            getter.setAccessible(true);
+            Object builder = getter.invoke(menu);
+            if (builder == null) return null;
+            M_NAV_MENUSIZE = builder.getClass().getMethod("size");
+            M_NAV_MENUITEM = builder.getClass().getMethod("getItem", int.class);
+            NAV_BUILDER = builder;
+            return builder;
+        } catch (Throwable ignored) { return null; }
+    }
+
+    /** 沿类链往上找第一个同名方法（getDeclaredMethod 只看本类，继承来的会漏）。 */
+
+    /**
+     * 让底栏剩余的 tab 均分整条栏。
+     *
+     * ── 定位过程（都是实测，不是推测）──
+     *  - 删掉 3 项后容器缩成 `338..742`（404 宽），两项挤在屏幕正中间，两侧大片留白；
+     *  - 干预测量规格没用：在 onMeasure 里打点发现
+     *    `specSize=1080 parentW=1080 selfW=1080`——菜单视图**已经测到满宽**了，
+     *    说明它不是自己算窄的，是父控件把它摆成了 404 宽的居中盒子；
+     *  - COUI 底栏是「每项固定约 202px、容器宽 = 项数 × 202」
+     *    （实测 5 项 1008 宽、2 项 404 宽），改子项 LayoutParams 也会被父控件
+     *    重新测回 202，无效。
+     *
+     * 所以正确的挂点是父控件的 onLayout：让它照常排完，再把菜单视图和它的直接
+     * 子项 layout 成均分。挂在这里还顺带保证了「下一轮布局不会把我们改回去」。
+     *
+     * 开销：只在底栏布局时触发，不是每帧路径；intercept 内只有一次类名比较，
+     * 绝大多数调用直接 proceed()。
+     */
+
+
+    private static Method findDeclaredMethod(Class<?> type, String name, Class<?>... params) {
+        for (Class<?> c = type; c != null; c = c.getSuperclass()) {
+            try { return c.getDeclaredMethod(name, params); }
+            catch (NoSuchMethodException ignored) { }
+        }
+        return null;
+    }
+
+    /** 第 index 个菜单项的文案；读不到返回 null。 */
+    private static String navItemTitle(Object builder, int index) {
+        if (builder == null || M_NAV_MENUSIZE == null) return null;
+        try {
+            if (((Integer) M_NAV_MENUSIZE.invoke(builder)).intValue() <= index) return null;
+            Object item = M_NAV_MENUITEM.invoke(builder, index);
+            if (item == null) return null;
+            if (M_ITEM_TITLE == null) {
+                M_ITEM_TITLE = item.getClass().getMethod("getTitle");
+                M_ITEM_TITLE.setAccessible(true);
             }
-        } catch (Throwable ignored) { }
-        // 只报一次，附上真实文案，便于对着真机核对隐藏名单
-        if (hidden > 0 || seen.length() > 0) reportTabsOnce(seen.toString(), hidden, kept);
+            Object title = M_ITEM_TITLE.invoke(item);
+            if (title == null) return null;
+            String value = title.toString().trim();
+            return value.length() == 0 ? null : value;
+        } catch (Throwable ignored) { return null; }
     }
 
     private static final java.util.concurrent.atomic.AtomicBoolean TABS_REPORTED =
@@ -1101,11 +1235,11 @@ public final class MainHook extends XposedModule {
 
     private static void reportTabsOnce(String seen, int hidden, int kept) {
         if (!TABS_REPORTED.compareAndSet(false, true)) return;
-        noteStatic("bottom_bar tabs seen=[" + seen + "] hidden=" + hidden + " kept=" + kept
-                + " filter=[" + TAB_LABELS + "]");
+        noteStatic("bottom_bar tabs seen=[" + seen + "] dropped=" + hidden + " kept=" + kept
+                + " keepList=[" + TAB_LABELS + "]");
     }
 
-    /** 取一个 tab 项的文案：先大标签，再小标签。取不到就返回 null（宁可不隐藏，也不误伤）。 */
+    /** 取一个 tab 项的文案：先大标签，再小标签。取不到就返回 null（宁可不删，也不误伤）。 */
     private static String tabTitle(View item) {
         String title = textOf(item, ID[K_TAB_LABEL_LARGE]);
         if (title == null) title = textOf(item, ID[K_TAB_LABEL_SMALL]);

@@ -8,13 +8,13 @@ OPPO / 欢太 **软件商店**（`com.heytap.market`）的 LSPosed 去广告模�
 ![License: GPL-3.0](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 ![Vector v2.2](https://img.shields.io/badge/框架-Vector%20v2.2%20(API%20102)-informational)
 ![目标版本](https://img.shields.io/badge/验证-26.5.2-9cf)
-![版本](https://img.shields.io/badge/发布-v0.4.0-success)
+![版本](https://img.shields.io/badge/发布-v0.5.0-success)
 
 ---
 
 ## 下载
 
-从 [Releases](https://github.com/2909272751/heytap-market-clean/releases) 下载 **`module-v0.4.0.apk`**。
+从 [Releases](https://github.com/2909272751/heytap-market-clean/releases) 下载 **`module-v0.5.0.apk`**。
 
 > `v0.2.0` 的标签在开发中被复用过，先后对应过两个行为不同的二进制，已标记为预发布。
 > **请用 v0.3.0。**
@@ -47,7 +47,7 @@ OPPO / 欢太 **软件商店**（`com.heytap.market`）的 LSPosed 去广告模�
 
 | 开关 | 对应页面 | 做法 |
 |---|---|---|
-| 底栏推广入口 | 底部导航栏 | **按 tab 文案**筛掉推广项；底栏与其余 tab 全部保留（不会让你切不到「我的」），隐藏项由剩下的自动重排补位。名单可在设置页编辑 |
+| 底栏精简 | 底部导航栏 | **默认只保留「首页」和「我的」**，其余入口（游戏/软件/榜单等）在**底栏建视图的那一步**就被移除——不是先画出来再隐藏，所以切页时不会闪一下。保留名单可在设置页编辑 |
 
 ### 我的页面
 
