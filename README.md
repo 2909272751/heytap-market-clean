@@ -5,15 +5,19 @@ OPPO / 欢太 **软件商店**（`com.heytap.market`）的 LSPosed 去广告模�
 拦弹窗广告、筛底栏推广入口、逐项清理「我的」页的推广位。**13 项可独立开关**，
 每项独立探针 + 命中计数，失效时如实上报而不是假装成功。
 
-[![License: GPL-3.0](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+![License: GPL-3.0](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 ![Vector v2.2](https://img.shields.io/badge/框架-Vector%20v2.2%20(API%20102)-informational)
 ![目标版本](https://img.shields.io/badge/验证-26.5.2-9cf)
+![版本](https://img.shields.io/badge/发布-v0.3.0-success)
 
 ---
 
 ## 下载
 
-从 [Releases](https://github.com/2909272751/heytap-market-clean/releases) 下载 `module-v0.2.0.apk`。
+从 [Releases](https://github.com/2909272751/heytap-market-clean/releases) 下载 **`module-v0.3.0.apk`**。
+
+> `v0.2.0` 的标签在开发中被复用过，先后对应过两个行为不同的二进制，已标记为预发布。
+> **请用 v0.3.0。**
 
 ## 安装
 
