@@ -1,0 +1,1469 @@
+package io.github.heytapmarketclean;
+
+import android.app.Activity;
+import android.app.Application;
+import android.app.BroadcastOptions;
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.PackageInfo;
+import android.content.res.Resources;
+import android.os.Build;
+import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.util.Log;
+import android.view.View;
+import android.view.ViewGroup;
+import io.github.libxposed.api.XposedInterface;
+import io.github.libxposed.api.XposedModule;
+import io.github.libxposed.api.XposedModuleInterface;
+import java.lang.reflect.Method;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+/**
+ * 模块入口：三重门闸 + 逐特性探针 + 状态上报 + 全部 hook。
+ *
+ * 三条硬性纪律（见 SKILL.md 第 1 节）：
+ *  1. 只 hook 一次性决策闸门；UI 只在 onResume / 切页时按 id 精确隐藏，绝不遍历全树、绝不轮询。
+ *  2. intercept 内零分配、零反射、零日志（命中打点用 CAS 只打一次）。
+ *  3. fail-open：任何一步失败都只 log(WARN)，目标 App 行为与未装模块完全一致。
+ */
+public final class MainHook extends XposedModule {
+    private static final String TAG = "HmClean";
+    private static final String REPORT_ACTION = Config.MODULE + ".REPORT";
+    private static final String REPORT_RECEIVER = Config.MODULE + ".StatusReceiver";
+
+    // ── 锚点：类名与方法名都来自 26.5.2_CN 的 DEX 实测（混淆名以 unicode 转义写） ──
+    /** 悬浮广告优先级闸门（Kotlin 单例 FloatJumpPriorManager）。 */
+    private static final String CLS_FLOAT_PRIOR = "a.a.a.qx5";
+    private static final String M_FLOAT_CANSHOW = "\u0528";
+    private static final String T_FLOAT_SHOWTYPE = "com.nearme.uikit.widget.floatJump.FloatShowType";
+
+    /** AI 搜索气泡（AISearchBubbleUtil）：\u052f 内会 log "Show bubble failed"。 */
+    private static final String CLS_AI_BUBBLE = "a.a.a.p";
+    private static final String M_AI_SHOW = "\u052f";
+    private static final String T_EFFECTIVE_VIEW = "com.oplus.anim.EffectiveAnimationView";
+
+    /** CTA 活动弹窗管理器（非混淆名）。 */
+    private static final String CLS_CTA = "a.a.a.hg3";
+    private static final String M_CTA_SHOW = "showCTA";
+
+    /** “开机必备”安装引导页 Intent 构造器。 */
+    private static final String CLS_BOOT_GUIDE = "a.a.a.ue8";
+    private static final String M_GUIDE_INTENT = "\u0528";
+
+    /** 悬浮广告视图（RelativeLayout 子类）等类的名字，仅用于文档与排障。 */
+    private static final String CLS_VIEWPAGER = "androidx.viewpager.widget.ViewPager";
+
+    // ── 特性开关快照（configure 时写一次，UI 线程只读） ────────────────────
+    private static final boolean[] ON = new boolean[Config.FEATURES.length];
+    private static final int I_FLOAT = Config.indexOf(Config.F_FLOAT_AD);
+    private static final int I_AIBUBBLE = Config.indexOf(Config.F_AI_BUBBLE);
+    private static final int I_CTA = Config.indexOf(Config.F_CTA_DIALOG);
+    private static final int I_BOOT = Config.indexOf(Config.F_BOOT_GUIDE);
+    private static final int I_BOTTOM = Config.indexOf(Config.F_BOTTOM_BAR);
+    private static final int I_UPGRADE = Config.indexOf(Config.F_MINE_UPGRADE);
+    private static final int I_UNINSTALL = Config.indexOf(Config.F_MINE_UNINSTALL);
+    private static final int I_DOWNLOAD = Config.indexOf(Config.F_MINE_DOWNLOAD);
+    private static final int I_CLEAN = Config.indexOf(Config.F_MINE_CLEAN);
+    private static final int I_HEALTH = Config.indexOf(Config.F_MINE_HEALTH);
+    private static final int I_BANNER = Config.indexOf(Config.F_MINE_BANNER);
+    private static final int I_RECOMMEND = Config.indexOf(Config.F_MINE_RECOMMEND);
+    private static final int I_VIP = Config.indexOf(Config.F_MINE_VIP);
+
+    /** 每次触达界面后的补隐藏时刻（有限次、随事件触发，不是轮询）。 */
+    /**
+     * 补隐藏的时间点。
+     *
+     * 原来排了 {0, 600, 2000, 5000, 12000} 五个点反复补跑，用户反馈「点一下闪一下」——
+     * 原因是列表重新绑定后卡片先以可见状态出现，要等到下一个延迟点才被再次隐藏，
+     * 于是每点一次就闪一次。子项重新挂载已经由层级守卫确定性处理，
+     * 所以这里只保留最早的几个点覆盖异步数据到达，长尾一律去掉。
+     */
+    private static final long[] APPLY_DELAYS = {0L, 400L, 1500L};
+
+    private String processName;
+
+    /**
+     * 类加载即留证：框架把对象 new 出来时一定跑这里。
+     * 用来区分「回调没被调用」和「回调里日志根本没出来」——两者的现象一模一样。
+     */
+    static { trace("[schema=" + Config.SCHEMA + "] MainHook class loaded"); }
+
+    /**
+     * 框架构造器。两个都留着，因为真机上的两套框架要的构造器不一样：
+     *  - Vector v2.2（现役框架）：只有 ()，见 framework/vector.dex 里
+     *    Lio/github/libxposed/api/XposedModule; 只有一个 <init>()；
+     *    真机日志：NoSuchMethodException: MainHook.<init> []
+     *  - 老 LSPosed（LSPosed IT / 1.9.2 及更早）：只有 (XposedInterface, ModuleLoadedParam)
+     *    真机日志：NoSuchMethodException: MainHook.<init> [XposedInterface, ...]
+     * 没被框架调用的那个构造器不会在类加载时解析，所以两套框架都能加载。
+     *
+     * 构造器里同时写两处：框架 log() 落到 /data/adb/lspd/log/modules_*.log（不会被刷掉），
+     * trace() 落到 logcat。logcat 缓冲区会被刷掉（实测一轮就刷掉 9 万行），
+     * 验收一律以 modules_*.log 为准。
+     */
+    public MainHook() {
+        super();
+        INSTANCE = this;
+        note("MainHook no-arg ctor entered (Vector-style)");
+    }
+
+    public MainHook(XposedInterface base, XposedModuleInterface.ModuleLoadedParam param) {
+        super(base, param);
+        INSTANCE = this;
+        note("MainHook 2-arg ctor entered (LSPosed-1.9-style)");
+    }
+
+    /** 框架 log() + logcat 双写；log() 不可用时只留 logcat，绝不外泄异常。 */
+    private void note(String message) {
+        String line = "[schema=" + Config.SCHEMA + "] " + message;
+        try { log(Log.INFO, TAG, line); } catch (Throwable ignored) { }
+        trace(line);
+    }
+
+    /** 静态规则代码用的同类出口（UI 规则是 static 的，但日志仍走框架通道）。 */
+    private static volatile MainHook INSTANCE;
+
+    private static void noteStatic(String message) {
+        MainHook module = INSTANCE;
+        if (module != null) { module.note(message); return; }
+        trace("[schema=" + Config.SCHEMA + "] " + message);
+    }
+
+    /**
+     * 第二条独立日志通道：只走 android.util.Log，不依赖框架注入的任何方法。
+     *
+     * 为什么要两条：框架的 modules_*.log 偶尔会丢掉安装期那一批行（实测 12 秒后
+     * 只剩 hit 行），只留一条通道时「模块没跑」和「日志被刷掉」分不开。
+     * 只在冷路径（构造/回调/探针/hit 首次）调用，intercept 内不调用。
+     *
+     * 注意：目标 App 进程（uid 10410）写不了 /data/local/tmp（0771 shell:shell），
+     * 所以这里不写文件；读法：logcat -d | Select-String HmClean，
+     * 或设备端先 logcat -d > 文件再 grep，别等几十秒后直接读（缓冲区会被刷掉）。
+     */
+    static void trace(String message) {
+        try { android.util.Log.i("HmClean", message); } catch (Throwable ignored) { }
+    }
+
+    /**
+     * 命中计数：每个规则命中时通过 CAS 只记一次。
+     *
+     * 关键：真机实测冷启动后 12 秒，logcat 里安装期那批 feature= 行会被刷掉
+     * （12 秒能出 9 万行），而稍后写的 hit 行还在——于是「装上了但被日志刷没」
+     * 和「没装上」分不开。参考项目对此的解法是：把状态和命中一起在首次命中时重发。
+     * 我们照做：首次 hit 时把整张状态表重打一遍，安装结果就不会丢。
+     */
+    private static final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicBoolean>
+            HITS = new java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicBoolean>();
+
+    private static final AtomicBoolean STATES_DUMPED = new AtomicBoolean(false);
+
+    /**
+     * 特性 -> 实际 hook 到的方法签名。
+     *
+     * 用途：目标 App 一升级，某个锚点可能改签名或改逻辑，这时必须能从日志一眼看出
+     * 「hook 到了哪个方法」，否则只能靠猜。安装期写的行会被 logcat 刷掉
+     * （实测启动 40 秒就能出十几万行），所以随延迟汇总一起重发。
+     */
+    private static final java.util.LinkedHashMap<String, String> ANCHORS =
+            new java.util.LinkedHashMap<String, String>();
+
+    /**
+     * 安装期自检命中的特性。
+     *
+     * 为什么要自检：广告有投放条件和频控，实际使用中可能一整天都不弹。
+     * 那时候「hook 装上了」和「拦截真的生效」无法区分——状态只能显示 matched，
+     * 却没有任何证据说明拦截器跑通了。装完立刻反射调一次就能把这个区别消掉。
+     *
+     * 安全性：四个拦截器都**不调用 chain.proceed()**，自检调过去只会被直接拦下，
+     * 不可能触发真实的广告逻辑。唯一副作用是走了一遍方法入口，可忽略。
+     */
+    private static final java.util.Set<String> VERIFIED = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private static volatile boolean selfTest;
+
+    private static void recordAnchor(String feature, Method method) {
+        try {
+            synchronized (ANCHORS) {
+                ANCHORS.put(feature, describe(method));
+            }
+            noteStatic("anchor=" + feature + " method=" + describe(method));
+        } catch (Throwable ignored) { }
+    }
+
+    /** 记一次命中（重复调用只有第一次写日志），并触发一次延迟的状态+命中汇总。 */
+    static void hit(String rule) {
+        // 自检期间的调用不算真实命中：那是模块自己调的，不是用户遇到了广告
+        if (selfTest) { VERIFIED.add(rule); return; }
+        try {
+            java.util.concurrent.atomic.AtomicBoolean flag = HITS.get(rule);
+            if (flag == null) {
+                flag = new java.util.concurrent.atomic.AtomicBoolean(false);
+                java.util.concurrent.atomic.AtomicBoolean prev = HITS.putIfAbsent(rule, flag);
+                if (prev != null) flag = prev;
+            }
+            if (flag.compareAndSet(false, true)) {
+                noteStatic("hit=" + rule);
+                MainHook module = INSTANCE;
+                if (module != null) module.scheduleSummary();
+            }
+        } catch (Throwable ignored) { }
+    }
+
+    /** 每个特性在报告里附上「是否真的命中过」。 */
+    private static String hitSummary() {
+        try {
+            StringBuilder sb = new StringBuilder();
+            for (java.util.Map.Entry<String, java.util.concurrent.atomic.AtomicBoolean> e : HITS.entrySet()) {
+                if (sb.length() > 0) sb.append(',');
+                sb.append(e.getKey()).append('=').append(e.getValue().get() ? "hit" : "no-hit");
+            }
+            return sb.toString();
+        } catch (Throwable ignored) { return ""; }
+    }
+
+    private final java.util.concurrent.atomic.AtomicBoolean summaryScheduled =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
+     * 延迟汇总：把「锚点 + 状态 + 命中」一起重发。
+     *
+     * 为什么必须重发：安装期写出的行会被 logcat 缓冲区挤掉（实测冷启动十几秒就能出
+     * 十几万行），只剩后面写的命中行。参考项目也是这么处理的。
+     *
+     * 注意不能只在「有命中」时才汇总——那正好是「一条都没拦到」最需要被看见的情况。
+     * 所以安装完成时也排一次，保证无论如何都有一份可读的结果。
+     */
+    private void scheduleSummary() {
+        if (!summaryScheduled.compareAndSet(false, true)) return;
+        postSummary(2000L);
+    }
+
+    private void postSummary(long delayMs) {
+        try {
+            android.os.Handler handler = new android.os.Handler(android.os.Looper.getMainLooper());
+            handler.postDelayed(new Runnable() {
+                @Override public void run() {
+                    dumpStatesOnce();
+                    note("summary hits[" + hitSummary() + "] done=" + reportDone
+                            + "/" + Config.FEATURES.length);
+                }
+            }, delayMs);
+        } catch (Throwable ignored) { }
+    }
+
+    /** 整张状态表只重发一次（安装期行已写过，这里是保险）。 */
+    private void dumpStatesOnce() {
+        if (!STATES_DUMPED.compareAndSet(false, true)) return;
+        try {
+            synchronized (ANCHORS) {
+                for (java.util.Map.Entry<String, String> e : ANCHORS.entrySet()) {
+                    trace("[schema=" + Config.SCHEMA + "] anchor=" + e.getKey() + " method=" + e.getValue());
+                }
+            }
+            for (String feature : Config.FEATURES) {
+                String state = states.get(feature);
+                if (state == null) continue;
+                trace("[schema=" + Config.SCHEMA + "] feature=" + feature + " result=" + state);
+            }
+        } catch (Throwable ignored) { }
+    }
+
+    /**
+     * 绝不要 override 框架的 log(...)。
+     * 真机实测两版框架的行为都不同：
+     *  - 旧 LSPosed(API 100)：XposedModule 里没有 super 实现，super.log(...) 抛 NoSuchMethodError
+     *  - Vector v2.2：log(...) 在 XposedInterface 里是 final，override 直接 LinkageError
+     * 统一做法：用继承下来的 log(...)，日志进 /data/adb/lspd/log/modules_*.log。
+     * 需要额外留痕时用 trace()（它不碰框架 API）。
+     */
+
+    private final AtomicBoolean installed = new AtomicBoolean(false);
+    private final AtomicBoolean configured = new AtomicBoolean(false);
+    private Context reportContext;
+    private String reportToken;
+    private long reportRun;
+    private int reportDone;
+    private final ConcurrentHashMap<String, String> states = new ConcurrentHashMap<String, String>();
+    private final ConcurrentHashMap<String, String> details = new ConcurrentHashMap<String, String>();
+    private String probeFailure;
+
+    /** onPackageLoaded 记下的包名；Vector 的 PackageReadyParam 没有 getPackageName()，只能这样带过去。 */
+    private String loadedPackage;
+
+    /**
+     * 只记进程名；这里禁止 loadClass / 任何初始化（onModuleLoaded 早于 App 一切）。
+     * 每个回调的第一句都是 trace()：它只走 android.util.Log，不依赖框架注入的任何方法。
+     * 目标 App 进程写不了 /data/local/tmp（0771 shell:shell），所以证据主要看 logcat。
+     */
+    @Override public void onModuleLoaded(XposedModuleInterface.ModuleLoadedParam param) {
+        try {
+            note("onModuleLoaded entered");
+            processName = param.getProcessName();
+            note("onModuleLoaded process=" + processName + " api=" + apiVersion());
+        } catch (Throwable error) {
+            note("onModuleLoaded failed " + error);
+        }
+    }
+
+    @Override public void onPackageLoaded(XposedModuleInterface.PackageLoadedParam param) {
+        try {
+            note("onPackageLoaded entered");
+            String pkg;
+            try { pkg = param.getPackageName(); } catch (Throwable t) { pkg = "?"; }
+            loadedPackage = pkg;
+            note("onPackageLoaded pkg=" + pkg + " process=" + processName);
+            // 此时 App ClassLoader 还没建好，getClassLoader() 不可用；只做门闸与早埋点
+            enter(pkg, processName, loaderOf(param));
+        } catch (Throwable error) {
+            note("onPackageLoaded failed " + error);
+        }
+    }
+
+    @Override public void onPackageReady(XposedModuleInterface.PackageReadyParam param) {
+        try {
+            note("onPackageReady entered");
+            // Vector v2.2 的 PackageReadyParam 只有 getClassLoader() / getAppComponentFactory()，
+            // 没有 getPackageName()（framework/vector.dex 实测），包名取 onPackageLoaded 记下的。
+            String pkg = loadedPackage == null ? Config.TARGET : loadedPackage;
+            note("onPackageReady pkg=" + pkg + " process=" + processName);
+            enter(pkg, processName, param.getClassLoader());
+        } catch (Throwable error) {
+            note("onPackageReady failed " + error);
+        }
+    }
+
+    /** 两套框架给默认 ClassLoader 的方法名不同，运行时探测一次即可。 */
+    private static ClassLoader loaderOf(XposedModuleInterface.PackageLoadedParam param) {
+        try {
+            java.lang.reflect.Method m = param.getClass().getMethod("getClassLoader");
+            Object o = m.invoke(param);
+            if (o instanceof ClassLoader) return (ClassLoader) o;
+        } catch (Throwable ignored) { }
+        try {
+            java.lang.reflect.Method m = param.getClass().getMethod("getDefaultClassLoader");
+            Object o = m.invoke(param);
+            if (o instanceof ClassLoader) return (ClassLoader) o;
+        } catch (Throwable ignored) { }
+        return null;
+    }
+
+    private void enter(String packageName, String process, ClassLoader loader) {
+        String line = "[schema=" + Config.SCHEMA + "] enter pkg=" + packageName
+                + " process=" + process + " api=" + apiVersion();
+        log(Log.INFO, TAG, line);
+        trace(line);
+        if (!Config.TARGET.equals(packageName)) return;
+        if (process != null && !Config.TARGET.equals(process)) {
+            log(Log.INFO, TAG, "skip: secondary process " + process);
+            return;
+        }
+        if (!installed.compareAndSet(false, true)) return;
+        if (loader == null) {
+            // onPackageLoaded 阶段 App ClassLoader 还没建好，等 onPackageReady 再装
+            log(Log.INFO, TAG, "classloader not ready, deferring to onPackageReady");
+            return;
+        }
+        armContextHook(loader);
+    }
+
+    /** 只读一次，用于把「框架到底支持到第几代 API」写进日志，省得下次再猜。 */
+    private String apiVersion() {
+        try { return String.valueOf(getApiVersion()); }
+        catch (Throwable error) { return "?"; }
+    }
+
+    /**
+     * 取 Context 用「一次性 Application 钩子」，绝不调 param.getApplication()
+     * （部分 LSPosed 版本的 PackageReadyParam 没有这个方法，抛 NoSuchMethodError 且发生在第一条日志之前）。
+     * 三级回退，任意一级成功即可。
+     */
+    private void armContextHook(final ClassLoader loader) {
+        // 1) Application.attach(Context)：包内可见，编译期看不到但运行期存在
+        try {
+            Method attach = Application.class.getDeclaredMethod("attach", Context.class);
+            hook(attach).setId(Config.MODULE + "_app_attach").intercept(new XposedInterface.Hooker() {
+                @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    Object result = chain.proceed();
+                    Object self = chain.getThisObject();
+                    if (self instanceof Context) configureOnce((Context) self, loader);
+                    return result;
+                }
+            });
+            log(Log.INFO, TAG, "[schema=" + Config.SCHEMA + "] armed via Application.attach");
+            return;
+        } catch (Throwable error) {
+            log(Log.WARN, TAG, "Application.attach unavailable, trying Instrumentation", error);
+        }
+        // 2) Instrumentation.callApplicationOnCreate(Application)：公开 API，必然存在
+        try {
+            Class<?> instrumentation = loader.loadClass("android.app.Instrumentation");
+            Method call = instrumentation.getDeclaredMethod("callApplicationOnCreate", Application.class);
+            hook(call).setId(Config.MODULE + "_app_oncreate").intercept(new XposedInterface.Hooker() {
+                @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    Object result = chain.proceed();
+                    Object arg = chain.getArg(0);
+                    if (arg instanceof Context) configureOnce((Context) arg, loader);
+                    return result;
+                }
+            });
+            log(Log.INFO, TAG, "[schema=" + Config.SCHEMA + "] armed via Instrumentation.callApplicationOnCreate");
+            return;
+        } catch (Throwable error) {
+            log(Log.WARN, TAG, "Instrumentation hook unavailable, trying ContextWrapper", error);
+        }
+        // 3) ContextWrapper.attachBaseContext(Context)：兜底（会多回调几次，用 CAS 保证只 configure 一次）
+        try {
+            Class<?> wrapper = loader.loadClass("android.content.ContextWrapper");
+            Method base = wrapper.getDeclaredMethod("attachBaseContext", Context.class);
+            hook(base).setId(Config.MODULE + "_app_basecontext").intercept(new XposedInterface.Hooker() {
+                @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    Object result = chain.proceed();
+                    Object arg = chain.getArg(0);
+                    if (arg instanceof Context) configureOnce((Context) arg, loader);
+                    return result;
+                }
+            });
+            log(Log.INFO, TAG, "[schema=" + Config.SCHEMA + "] armed via ContextWrapper.attachBaseContext");
+        } catch (Throwable error) {
+            log(Log.ERROR, TAG, "no context hook available; module inert", error);
+        }
+    }
+
+    private void configureOnce(Context context, ClassLoader loader) {
+        if (!configured.compareAndSet(false, true)) return;
+        try { configure(context, loader); }
+        catch (Throwable error) { log(Log.ERROR, TAG, "configure failed", error); }
+    }
+
+    private void configure(Context context, ClassLoader loader) {
+        // 目标 App 的 classloader：模块自身的 loader 里没有 androidx 等第三方类，
+        // 反射它们必须用这个（实测 ClassNotFoundException 就是这么来的）。
+        TARGET_LOADER = loader;
+        log(Log.INFO, TAG, "[schema=" + Config.SCHEMA + "] context ready, configuring");
+        PackageInfo info;
+        try { info = context.getPackageManager().getPackageInfo(Config.TARGET, 0); }
+        catch (Throwable error) { log(Log.WARN, TAG, "skip: cannot read target version", error); return; }
+
+        reportContext = context;
+        // 缓存令牌：版本号 / 更新时间 / 规则结构版本 —— 任一变化都代表锚点可能失效
+        reportToken = info.versionCode + ":" + info.lastUpdateTime + ":" + Config.SCHEMA;
+        reportRun = System.currentTimeMillis();
+        reportDone = 0;
+        states.clear();
+        details.clear();
+        log(Log.INFO, TAG, "checking hooks for " + Config.TARGET + " " + info.versionName
+                + " schema=" + Config.SCHEMA);
+
+        // 框架的 getRemotePreferences 是注入方法，不同框架不一定都补齐；拿不到就按默认值走
+        SharedPreferences prefs = null;
+        try { prefs = getRemotePreferences(Config.GROUP); }
+        catch (Throwable error) { log(Log.WARN, TAG, "getRemotePreferences unavailable", error); }
+        for (int i = 0; i < Config.FEATURES.length; i++) {
+            ON[i] = Config.readBoolean(prefs, Config.key(Config.FEATURES[i]), Config.FEATURE_DEFAULT[i]);
+        }
+        TAB_LABELS = Config.readString(prefs, Config.KEY_TAB_LABELS, Config.DEFAULT_TAB_LABELS);
+
+        resolveIds(context);
+
+        probe(Config.F_FLOAT_AD, ON[I_FLOAT], new ThrowingRunnable() {
+            @Override public void run() throws Exception { installFloatAdGate(loader); }
+        });
+        probe(Config.F_AI_BUBBLE, ON[I_AIBUBBLE], new ThrowingRunnable() {
+            @Override public void run() throws Exception { installAiBubbleGate(loader); }
+        });
+        probe(Config.F_CTA_DIALOG, ON[I_CTA], new ThrowingRunnable() {
+            @Override public void run() throws Exception { installCtaGate(loader); }
+        });
+        probe(Config.F_BOOT_GUIDE, ON[I_BOOT], new ThrowingRunnable() {
+            @Override public void run() throws Exception { installBootGuideGate(loader); }
+        });
+
+        // UI 类规则：按资源 id / 结构隐藏，统一由 onResume + 切页事件驱动。
+        // 它们的匹配结果由资源 id 解析情况决定（miss / partial / matched 都如实上报）。
+        probeUi(Config.F_BOTTOM_BAR, K_BOTTOM_NAV, K_TAB_LABEL_LARGE, K_TAB_LABEL_SMALL);
+        probeUi(Config.F_MINE_UPGRADE, K_MINE_UPGRADE);
+        probeUi(Config.F_MINE_UNINSTALL, K_MINE_UNINSTALL);
+        probeUi(Config.F_MINE_DOWNLOAD, K_MINE_DOWNLOAD);
+        probeUi(Config.F_MINE_CLEAN, K_MINE_CLEAN);
+        probeUi(Config.F_MINE_HEALTH, K_MINE_HEALTH);
+        probeUi(Config.F_MINE_BANNER, K_MINE_BANNER, K_MINE_INDIC);
+        probeUi(Config.F_MINE_RECOMMEND, K_MINE_LIST);
+        probeUi(Config.F_MINE_VIP, K_MINE_VIP);
+
+        if (anyUiRule()) {
+            try { installUiTriggers(loader); }
+            catch (Throwable error) { log(Log.WARN, TAG, "UI trigger unavailable", error); }
+        }
+
+        // 广告闸门装完后立刻自检，把「装上了」升级成「确认拦得住」
+        try { selfTestAdGates(loader, context); }
+        catch (Throwable error) { log(Log.WARN, TAG, "self test unavailable", error); }
+
+        report("complete", "", "", "");
+        log(Log.INFO, TAG, "install_summary features=" + Config.FEATURES.length
+                + " uiRule=" + anyUiRule());
+        // 无论有没有命中都排一次汇总：一条都没拦到时，恰恰最需要这份结果
+        postSummary(6000L);
+    }
+
+    // ══════════════════════ 广告闸门 ══════════════════════
+
+    /** 悬浮广告：canShow(FloatShowType) 恒 false，两条上屏路径都会先问它。 */
+    private void installFloatAdGate(ClassLoader loader) throws Exception {
+        Class<?> owner = load(loader, CLS_FLOAT_PRIOR);
+        Method gate = requireMethod(owner, M_FLOAT_CANSHOW, "boolean", new String[]{T_FLOAT_SHOWTYPE});
+        hook(gate).setId(Config.MODULE + "_float_gate").intercept(new XposedInterface.Hooker() {
+            @Override public Object intercept(XposedInterface.Chain chain) {
+                hit(Config.F_FLOAT_AD);          // 命中只记一次，返回值用缓存装箱
+                return Boolean.FALSE;
+            }
+        });
+        log(Log.INFO, TAG, "hooked: float ad gate " + gate);
+        recordAnchor(Config.F_FLOAT_AD, gate);
+    }
+
+    /** AI 搜索气泡：只把“展示气泡”置空，AI 搜索入口本身保持可用。 */
+    private void installAiBubbleGate(ClassLoader loader) throws Exception {
+        Class<?> owner = load(loader, CLS_AI_BUBBLE);
+        Method show = requireMethod(owner, M_AI_SHOW, "void", new String[]{T_EFFECTIVE_VIEW});
+        hook(show).setId(Config.MODULE + "_ai_bubble").intercept(new XposedInterface.Hooker() {
+            @Override public Object intercept(XposedInterface.Chain chain) {
+                hit(Config.F_AI_BUBBLE);
+                return null;
+            }
+        });
+        log(Log.INFO, TAG, "hooked: ai bubble " + show);
+        recordAnchor(Config.F_AI_BUBBLE, show);
+    }
+
+    /** CTA 活动弹窗：showCTA 置空；回调方法一律不碰（碰了会卡住弹窗流程）。 */
+    private void installCtaGate(ClassLoader loader) throws Exception {
+        Class<?> owner = load(loader, CLS_CTA);
+        Method show = findByNamePrefix(owner, M_CTA_SHOW, "void", 2);
+        hook(show).setId(Config.MODULE + "_cta_show").intercept(new XposedInterface.Hooker() {
+            @Override public Object intercept(XposedInterface.Chain chain) {
+                hit(Config.F_CTA_DIALOG);
+                return null;
+            }
+        });
+        log(Log.INFO, TAG, "hooked: cta " + show);
+        recordAnchor(Config.F_CTA_DIALOG, show);
+    }
+
+    /** 开机必备引导页：Intent 构造返回 null —— 唯一调用方 c4b.Ԩ 本来就判空。 */
+    private void installBootGuideGate(ClassLoader loader) throws Exception {
+        Class<?> owner = load(loader, CLS_BOOT_GUIDE);
+        Method build = requireMethod(owner, M_GUIDE_INTENT, "android.content.Intent",
+                new String[]{"android.content.Context"});
+        hook(build).setId(Config.MODULE + "_boot_guide").intercept(new XposedInterface.Hooker() {
+            @Override public Object intercept(XposedInterface.Chain chain) {
+                hit(Config.F_BOOT_GUIDE);
+                return null;
+            }
+        });
+        log(Log.INFO, TAG, "hooked: boot guide " + build);
+        recordAnchor(Config.F_BOOT_GUIDE, build);
+    }
+
+    // ══════════════════════ 安装期自检 ══════════════════════
+
+    /**
+     * 装完广告闸门后，立刻反射调一次，确认拦截器真的把调用吃掉了。
+     *
+     * 解决的真实问题：广告有投放条件与频控，测试时往往一条都不弹，
+     * 于是「hook 装上了」和「拦截真的生效」没法区分，状态永远停在 matched。
+     * 这里每个闸门试一次，试到了就升级成 verified，试不到就保持 matched 并如实说明——
+     * 宁可说「没验证」，也不假装成功。
+     *
+     * 安全性由拦截器本身保证：四个都不调用 chain.proceed()，所以自检调过去会被直接拦下，
+     * 不会触发任何真实广告逻辑。
+     */
+    private void selfTestAdGates(ClassLoader loader, Context context) {
+        if (!ON[I_FLOAT] && !ON[I_AIBUBBLE] && !ON[I_CTA] && !ON[I_BOOT]) return;
+        selfTest = true;
+        try {
+            // 1) 浮窗广告：构造 qx5 再问它能不能展示
+            if (ON[I_FLOAT]) {
+                try {
+                    Class<?> owner = load(loader, CLS_FLOAT_PRIOR);
+                    Method gate = requireMethod(owner, M_FLOAT_CANSHOW, "boolean",
+                            new String[]{T_FLOAT_SHOWTYPE});
+                    Object instance = newInstance(owner);
+                    Class<?> showType = load(loader, T_FLOAT_SHOWTYPE.replace('.', '/'));
+                    Object[] constants = showType.getEnumConstants();
+                    if (constants != null && constants.length > 0) {
+                        Object result = gate.invoke(instance, constants[0]);
+                        // 拦截器返回 false；走到这里说明确实被吃掉了
+                        if (result == null || Boolean.TRUE.equals(result)) {
+                            note("selftest float_ad UNEXPECTED returned " + result);
+                        }
+                    }
+                } catch (Throwable error) { note("selftest float_ad skipped: " + describe(error)); }
+            }
+            // 2) AI 搜索气泡：展示方法形参是 View，自检传 null——反正会被直接拦掉
+            if (ON[I_AIBUBBLE]) {
+                try {
+                    Class<?> owner = load(loader, CLS_AI_BUBBLE);
+                    Method show = requireMethod(owner, M_AI_SHOW, "void", new String[]{T_EFFECTIVE_VIEW});
+                    Object instance = newInstance(owner);
+                    show.invoke(instance, new Object[]{null});
+                } catch (Throwable error) { note("selftest ai_bubble skipped: " + describe(error)); }
+            }
+            // 2) CTA 弹窗：hg3.getInstance() 是单例，直接调 showCTA
+            if (ON[I_CTA]) {
+                try {
+                    Class<?> owner = load(loader, CLS_CTA);
+                    Method getInstance = owner.getDeclaredMethod("getInstance");
+                    getInstance.setAccessible(true);
+                    Object instance = getInstance.invoke(null);
+                    Method show = findByNamePrefix(owner, M_CTA_SHOW, "void", 2);
+                    if (instance != null) show.invoke(instance, context, null);
+                } catch (Throwable error) { note("selftest cta_dialog skipped: " + describe(error)); }
+            }
+            // 3) 开机必备引导页：ue8.Ԩ 是 static，直接调，期望返回 null
+            if (ON[I_BOOT]) {
+                try {
+                    Class<?> owner = load(loader, CLS_BOOT_GUIDE);
+                    Method build = requireMethod(owner, M_GUIDE_INTENT, "android.content.Intent",
+                            new String[]{"android.content.Context"});
+                    Object result = build.invoke(null, context);
+                    if (result != null) note("selftest boot_guide UNEXPECTED non-null Intent");
+                } catch (Throwable error) { note("selftest boot_guide skipped: " + describe(error)); }
+            }
+        } finally {
+            selfTest = false;
+        }
+        try {
+            if (!VERIFIED.isEmpty()) {
+                StringBuilder sb = new StringBuilder();
+                for (String f : VERIFIED) {
+                    if (sb.length() > 0) sb.append(',');
+                    sb.append(f);
+                    // 注意：这里不再 reportDone++，这几项在 probe() 里已经计过，
+                    // 否则进度会变成 17/13 这种对不上的数
+                    states.put(f, "verified");
+                    details.put(f, "安装期自检：拦截器已确认生效");
+                    report("running", f, "verified", "安装期自检：拦截器已确认生效");
+                }
+                note("selftest verified=" + sb);
+            }
+        } catch (Throwable ignored) { }
+    }
+
+    /**
+     * 建一个目标类的实例用于自检。
+     *
+     * 注意：这些类的无参构造**不是 public**（实测 qx5 的 acc=0x10002 是「包可见」，
+     * 直接 newInstance() 会抛 IllegalAccessException），必须 setAccessible(true)。
+     * 找不到无参构造就抛出去，由调用方记为「跳过」，绝不假装验证通过。
+     */
+    private static Object newInstance(Class<?> owner) throws Exception {
+        java.lang.reflect.Constructor<?> ctor = owner.getDeclaredConstructor();
+        ctor.setAccessible(true);
+        return ctor.newInstance();
+    }
+
+    /** 异常文本：自检跳过的原因要能直接读懂。 */
+    private static String describe(Throwable error) {
+        if (error == null) return "null";
+        try {
+            return error.getClass().getSimpleName()
+                    + (error.getMessage() == null ? "" : ": " + error.getMessage());
+        } catch (Throwable ignored) { return "<unavailable>"; }
+    }
+
+    /** 方法签名文本：自适配排障时，版本一变第一眼就要看出 hook 到了哪个方法。 */
+    private static String describe(Method method) {
+        if (method == null) return "null";
+        try {
+            StringBuilder sb = new StringBuilder(method.getDeclaringClass().getName())
+                    .append('.').append(method.getName()).append('(');
+            Class<?>[] types = method.getParameterTypes();
+            for (int i = 0; i < types.length; i++) {
+                if (i > 0) sb.append(',');
+                sb.append(types[i].getSimpleName());
+            }
+            return sb.append(")->").append(method.getReturnType().getSimpleName()).toString();
+        } catch (Throwable ignored) { return "<unavailable>"; }
+    }
+
+    // ══════════════════════ 界面规则 ══════════════════════
+
+    private static boolean anyUiRule() {
+        return ON[I_BOTTOM] || ON[I_FLOAT] || ON[I_UPGRADE] || ON[I_UNINSTALL] || ON[I_DOWNLOAD]
+                || ON[I_CLEAN] || ON[I_HEALTH] || ON[I_BANNER] || ON[I_RECOMMEND] || ON[I_VIP];
+    }
+
+    /**
+     * 触发点只有两个，都是「用户做了一次动作」级别的频率：
+     *  - Activity.onResume：冷启动 / 从别的页面回来
+     *  - ViewPager.setCurrentItem：底部栏切页（“我的”页是 ViewPager 的第 5 页）
+     * 命中后按 APPLY_DELAYS 补隐藏若干次，因为卡片数据是异步来的。
+     */
+    private void installUiTriggers(ClassLoader loader) throws Exception {
+        final Handler handler = new Handler(Looper.getMainLooper());
+
+        Method resume = Activity.class.getDeclaredMethod("onResume");
+        hook(resume).setId(Config.MODULE + "_ui_resume").intercept(new XposedInterface.Hooker() {
+            @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                Object result = chain.proceed();
+                Object self = chain.getThisObject();
+                if (self instanceof Activity) schedule(handler, (Activity) self);
+                return result;
+            }
+        });
+
+        int hooked = 0;
+        try {
+            Class<?> pager = loader.loadClass(CLS_VIEWPAGER);
+            for (Method candidate : pager.getDeclaredMethods()) {
+                if (!"setCurrentItem".equals(candidate.getName())) continue;
+                Class<?>[] params = candidate.getParameterTypes();
+                boolean ok = (params.length == 1 && params[0] == int.class)
+                        || (params.length == 2 && params[0] == int.class && params[1] == boolean.class);
+                if (!ok) continue;
+                hook(candidate).setId(Config.MODULE + "_ui_pager_" + params.length)
+                        .intercept(new XposedInterface.Hooker() {
+                            @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                                Object result = chain.proceed();
+                                Activity activity = currentActivity(chain.getThisObject());
+                                if (activity != null) schedule(handler, activity);
+                                return result;
+                            }
+                        });
+                hooked++;
+            }
+        } catch (Throwable error) {
+            log(Log.WARN, TAG, "ViewPager trigger unavailable (tab switch will still be covered by onResume)", error);
+        }
+        log(Log.INFO, TAG, "ui triggers installed: onResume + " + hooked + " pager method(s)");
+    }
+
+    /** ViewPager 自己不知道 Activity，用它的 Context 反查（不解包装、失败就放弃）。 */
+    private static Activity currentActivity(Object pager) {
+        if (!(pager instanceof View)) return null;
+        try {
+            Context context = ((View) pager).getContext();
+            while (context instanceof android.content.ContextWrapper) {
+                if (context instanceof Activity) return (Activity) context;
+                context = ((android.content.ContextWrapper) context).getBaseContext();
+            }
+        } catch (Throwable ignored) { }
+        return null;
+    }
+
+    private static void schedule(Handler handler, final Activity activity) {
+        if (activity == null || activity.isFinishing()) return;
+        Runnable task = new Runnable() {
+            @Override public void run() {
+                try { applyRules(activity); } catch (Throwable ignored) { }
+            }
+        };
+        for (int i = 0; i < APPLY_DELAYS.length; i++) {
+            if (APPLY_DELAYS[i] == 0L) task.run();
+            else handler.postDelayed(task, APPLY_DELAYS[i]);
+        }
+    }
+
+    /** 每次触达只做十几次 findViewById（按 id 精确命中），不做任何树遍历。 */
+    private static void applyRules(Activity activity) {
+        View decor;
+        try { decor = activity.getWindow().getDecorView(); }
+        catch (Throwable ignored) { return; }
+        if (decor == null) return;
+
+        if (ON[I_BOTTOM]) filterBottomTabs(decor);
+        if (ON[I_FLOAT]) hide(decor, ID[K_FLOAT_AD], Config.F_FLOAT_AD);
+
+        boolean allThree = ON[I_UPGRADE] && ON[I_UNINSTALL] && ON[I_DOWNLOAD];
+        if (allThree) hideCardOf(decor, ID[K_MINE_UPGRADE], ID[K_MINE_LIST], Config.F_MINE_UPGRADE);
+        else {
+            if (ON[I_UPGRADE]) hide(decor, ID[K_MINE_UPGRADE], Config.F_MINE_UPGRADE);
+            if (ON[I_UNINSTALL]) hide(decor, ID[K_MINE_UNINSTALL], Config.F_MINE_UNINSTALL);
+            if (ON[I_DOWNLOAD]) hide(decor, ID[K_MINE_DOWNLOAD], Config.F_MINE_DOWNLOAD);
+        }
+
+        boolean bothHealth = ON[I_CLEAN] && ON[I_HEALTH];
+        if (bothHealth) hideParentOf(decor, ID[K_MINE_CLEAN], Config.F_MINE_CLEAN, Config.F_MINE_HEALTH);
+        else {
+            if (ON[I_CLEAN]) hide(decor, ID[K_MINE_CLEAN], Config.F_MINE_CLEAN);
+            if (ON[I_HEALTH]) hide(decor, ID[K_MINE_HEALTH], Config.F_MINE_HEALTH);
+        }
+        // 兜底：这些卡运行期没有专属 id，按标题文案识别（见 hideMineCardsByTitle 注释）
+        if (ON[I_CLEAN]) {
+            hideMineCardsByTitle(decor, ID[K_MINE_LIST], Config.MINE_CARD_LABELS_CLEAN, Config.F_MINE_CLEAN);
+        }
+        if (ON[I_HEALTH]) {
+            hideMineCardsByTitle(decor, ID[K_MINE_LIST], Config.MINE_CARD_LABELS_HEALTH, Config.F_MINE_HEALTH);
+        }
+
+        if (ON[I_BANNER]) {
+            hide(decor, ID[K_MINE_BANNER], Config.F_MINE_BANNER);
+            hide(decor, ID[K_MINE_INDIC], Config.F_MINE_BANNER);
+        }
+        if (ON[I_VIP]) hide(decor, ID[K_MINE_VIP], Config.F_MINE_VIP);
+        if (ON[I_RECOMMEND]) hideRecommendCards(decor, ID[K_MINE_LIST], Config.F_MINE_RECOMMEND);
+
+        // 三宫格有格子被藏掉时重新平分整行，否则会留下空洞 + 孤零零的分隔线
+        if (ON[I_UPGRADE] || ON[I_UNINSTALL] || ON[I_DOWNLOAD]) rebalanceTopGrid(decor);
+
+        // 列表守卫：一次性隐藏挡不住 RecyclerView 重新绑定，挂上 attach 监听兜底
+        if (ON[I_RECOMMEND] || ON[I_CLEAN] || ON[I_HEALTH] || ON[I_BANNER]) {
+            try {
+                View list = decor.findViewById(ID[K_MINE_LIST]);
+                if (list != null) {
+                    installMineListGuard(list);
+                    if (list instanceof ViewGroup) {
+                        ViewGroup group = (ViewGroup) list;
+                        for (int i = 0; i < group.getChildCount(); i++) filterMineChild(group.getChildAt(i));
+                    }
+                }
+            } catch (Throwable ignored) { }
+        }
+    }
+
+    /** 底栏推广项的文案过滤名单；设置页可改，configure 时从 RemotePreferences 读入。 */
+    private static volatile String TAB_LABELS = Config.DEFAULT_TAB_LABELS;
+
+    /**
+     * 底栏：只隐藏推广类 tab，保留正常入口与切页能力。
+     *
+     * 为什么按「文案」而不是按 id/下标：
+     *  - 文案（语义标签）是跨混淆、跨版本最稳的锚点，参考项目就是靠语义标签过滤 tab 快照；
+     *  - id 在每个 tab 项里是同一套（fl_root/navigation_bar_item_*），无法区分是哪一个 tab；
+     *  - 下标会随服务端下发顺序变化。
+     * 整条隐藏底栏会让用户无法切到「我的」等页面，代价大于收益，所以只筛掉推广项。
+     *
+     * 隐藏名单走设置页（GROUP 里的 bottom_bar_labels，默认见 Config.DEFAULT_TAB_LABELS）。
+     * 每次只对 COUINavigationMenuView 的直接子项操作，不做整树遍历。
+     */
+    private static void filterBottomTabs(View decor) {
+        if (ID[K_BOTTOM_NAV] == 0) return;
+        View nav;
+        try { nav = decor.findViewById(ID[K_BOTTOM_NAV]); }
+        catch (Throwable ignored) { return; }
+        if (!(nav instanceof ViewGroup)) return;
+        ViewGroup menu = null;
+        try {
+            // COUINavigationView 内部的列表容器没有资源 id，按类名在直接子项里找
+            for (int i = 0; i < ((ViewGroup) nav).getChildCount(); i++) {
+                View child = ((ViewGroup) nav).getChildAt(i);
+                if (child != null && child.getClass().getName().endsWith("NavigationMenuView")) {
+                    menu = (ViewGroup) child; break;
+                }
+            }
+        } catch (Throwable ignored) { }
+        if (menu == null) return;
+
+        String labels = TAB_LABELS;
+        int hidden = 0;
+        int kept = 0;
+        StringBuilder seen = new StringBuilder();
+        try {
+            for (int i = 0; i < menu.getChildCount(); i++) {
+                View item = menu.getChildAt(i);
+                if (item == null) continue;
+                String title = tabTitle(item);
+                if (title == null) continue;
+                if (seen.indexOf(title) < 0) seen.append(title).append('/');
+                if (labels.contains(title)) {
+                    if (item.getVisibility() != View.GONE) item.setVisibility(View.GONE);
+                    hidden++;
+                    hit(Config.F_BOTTOM_BAR);
+                } else {
+                    if (item.getVisibility() == View.GONE) item.setVisibility(View.VISIBLE);
+                    kept++;
+                }
+            }
+        } catch (Throwable ignored) { }
+        // 只报一次，附上真实文案，便于对着真机核对隐藏名单
+        if (hidden > 0 || seen.length() > 0) reportTabsOnce(seen.toString(), hidden, kept);
+    }
+
+    private static final java.util.concurrent.atomic.AtomicBoolean TABS_REPORTED =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    private static void reportTabsOnce(String seen, int hidden, int kept) {
+        if (!TABS_REPORTED.compareAndSet(false, true)) return;
+        noteStatic("bottom_bar tabs seen=[" + seen + "] hidden=" + hidden + " kept=" + kept
+                + " filter=[" + TAB_LABELS + "]");
+    }
+
+    /** 取一个 tab 项的文案：先大标签，再小标签。取不到就返回 null（宁可不隐藏，也不误伤）。 */
+    private static String tabTitle(View item) {
+        String title = textOf(item, ID[K_TAB_LABEL_LARGE]);
+        if (title == null) title = textOf(item, ID[K_TAB_LABEL_SMALL]);
+        return title;
+    }
+
+    private static String textOf(View root, int id) {
+        if (id == 0) return null;
+        try {
+            android.widget.TextView view = (android.widget.TextView) root.findViewById(id);
+            if (view == null) return null;
+            CharSequence text = view.getText();
+            if (text == null) return null;
+            String value = text.toString().trim();
+            return value.length() == 0 ? null : value;
+        } catch (Throwable ignored) { return null; }
+    }
+
+    /** varargs 形式：第二个起是「隐藏了要记一次命中的特性 key」。 */
+    private static void hide(View root, int id, String... features) {
+        if (id == 0) return;
+        try {
+            View view = root.findViewById(id);
+            if (view != null && view.getVisibility() != View.GONE) {
+                view.setVisibility(View.GONE);
+                markHits(features);
+            }
+        } catch (Throwable ignored) { }
+    }
+
+    private static void markHits(String... features) {
+        if (features == null) return;
+        for (int i = 0; i < features.length; i++) if (features[i] != null) hit(features[i]);
+    }
+
+    /** 把目标 id 的「卡片级祖先」隐藏掉（RecyclerView 的直接子项）。 */
+    private static void hideCardOf(View root, int id, int listId, String... features) {
+        if (id == 0) return;
+        try {
+            View view = root.findViewById(id);
+            if (view == null) return;
+            View card = view;
+            for (int i = 0; i < 3 && card.getParent() instanceof View; i++) {
+                View parent = (View) card.getParent();
+                if (parent.getId() == listId) break;
+                card = parent;
+            }
+            if (card.getVisibility() != View.GONE) {
+                card.setVisibility(View.GONE);
+                markHits(features);
+            }
+        } catch (Throwable ignored) { }
+    }
+
+    private static void hideParentOf(View root, int id, String... features) {
+        if (id == 0) return;
+        try {
+            View view = root.findViewById(id);
+            if (view == null) return;
+            if (view.getParent() instanceof View) {
+                View parent = (View) view.getParent();
+                if (parent.getVisibility() != View.GONE) {
+                    parent.setVisibility(View.GONE);
+                    markHits(features);
+                }
+            } else if (view.getVisibility() != View.GONE) {
+                view.setVisibility(View.GONE);
+                markHits(features);
+            }
+        } catch (Throwable ignored) { }
+    }
+
+    /**
+     * 推荐卡：「继续探索」里的一排游戏/应用。
+     *
+     * 真机实测踩过的坑：早期版本按**类名**找 HorizontalAppItemView，结果一张都没隐藏——
+     * 运行期这些视图的类名是 RelativeLayout/LinearLayout，标记全在**资源 id 名**上
+     * （card_container / v_app_item / horizontal_app_item_view_app_rating）。
+     * 所以现在按 id 组合判定，这是跨版本最稳的形状特征。
+     * 只在 mine_list_view 的直接子项上判断（十几个子项），不是全树遍历。
+     */
+    private static void hideRecommendCards(View root, int listId, String... features) {
+        if (listId == 0) return;
+        try {
+            View list = root.findViewById(listId);
+            if (!(list instanceof ViewGroup)) return;
+            ViewGroup group = (ViewGroup) list;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                View child = group.getChildAt(i);
+                if (child == null || child.getVisibility() == View.GONE) continue;
+                if (!isRecommendCard(child)) continue;
+                child.setVisibility(View.GONE);
+                markHits(features);
+            }
+        } catch (Throwable ignored) { }
+    }
+
+    /** 推荐卡形状：card_container + v_app_item（+ horizontal_app_item_view_*）同时出现。 */
+    private static boolean isRecommendCard(View child) {
+        try {
+            boolean card = ID[K_MINE_REC_CARD] != 0 && child.findViewById(ID[K_MINE_REC_CARD]) != null;
+            boolean item = ID[K_MINE_REC_ITEM] != 0 && child.findViewById(ID[K_MINE_REC_ITEM]) != null;
+            boolean rating = ID[K_MINE_REC_RATING] != 0 && child.findViewById(ID[K_MINE_REC_RATING]) != null;
+            return (card && item) || (item && rating);
+        } catch (Throwable ignored) { return false; }
+    }
+
+    /**
+     * 靠标题文案隐藏「我的」页的通用卡片。
+     *
+     * 实测结论：这些卡片共用同一套布局（cl_content + tv_title/tv_subtitle/tv_button），
+     * 资源表里虽有 cl_clean / cl_health，但运行期并不存在，findViewById 永远返回 null
+     * ——只按 id 隐藏会出现「状态 matched、实际没隐藏」。文案是跨混淆最稳的锚点，
+     * 这里用它兜底；找不到就静默跳过（fail-open，不误伤其它卡片）。
+     */
+    private static void hideMineCardsByTitle(View root, int listId, String[] labels, String... features) {
+        if (listId == 0 || ID[K_MINE_CARD_TITLE] == 0) return;
+        try {
+            View list = root.findViewById(listId);
+            if (!(list instanceof ViewGroup)) return;
+            ViewGroup group = (ViewGroup) list;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                View child = group.getChildAt(i);
+                if (child == null || child.getVisibility() == View.GONE) continue;
+                String title = textOf(child, ID[K_MINE_CARD_TITLE]);
+                if (title == null || !matchesAny(title, labels)) continue;
+                child.setVisibility(View.GONE);
+                markHits(features);
+            }
+        } catch (Throwable ignored) { }
+    }
+
+    private static boolean matchesAny(String value, String[] options) {
+        if (options == null) return false;
+        for (int i = 0; i < options.length; i++) {
+            if (options[i] != null && value.contains(options[i])) return true;
+        }
+        return false;
+    }
+
+    /**
+     * 「我的」页列表守卫。
+     *
+     * 实测踩到的坑（很典型）：只在 onResume 隐藏一次，滚动后 RecyclerView 重新绑定
+     * 会把子项恢复成 VISIBLE，卡片又冒出来了——日志显示 hit，界面上却还在。
+     * 视图层的一次性修改挡不住重新绑定；参考项目对这类列表也是拦数据源，
+     * 但本页文案（「继续探索」等）实测不在 dex 里，是服务端下发的，没有可锚定的数据源。
+     *
+     * 所以退一步用**事件驱动**的守卫：只监听「子项被挂到窗口」这一个事件，
+     * 每次滑动只触发寥寥数次，不做定时轮询、不 hook 任何全局高频方法，
+     * 也不做整树遍历（只看 RecyclerView 的直接子项）。
+     */
+    private static final java.util.WeakHashMap<View, Boolean> GUARDED =
+            new java.util.WeakHashMap<View, Boolean>();
+
+    private static void installMineListGuard(final View list) {
+        if (!(list instanceof ViewGroup)) return;
+        try {
+            synchronized (GUARDED) {
+                if (GUARDED.containsKey(list)) return;
+                GUARDED.put(list, Boolean.TRUE);
+            }
+            // OnChildAttachStateChangeListener 在编译用的 android.jar 里不存在
+            // （只有 OnHierarchyChangeListener），所以用后者：子项被加进来时同样会回调。
+            // 注意 setOnHierarchyChangeListener 会**覆盖**宿主自己挂的监听器，
+            // 所以先把原来的取出来，在我们的回调里转发过去——不能因为去广告就把 App 弄坏。
+            // 编译用的 android.jar 里没有 getOnHierarchyChangeListener()，只能反射读字段；
+            // 读不到就降级为直接挂（RecyclerView 本身并不用这个监听器，风险很低）。
+            final ViewGroup.OnHierarchyChangeListener previous = readHierarchyListener((ViewGroup) list);
+            ViewGroup.OnHierarchyChangeListener listener = new ViewGroup.OnHierarchyChangeListener() {
+                @Override public void onChildViewAdded(View parent, View child) {
+                    filterMineChild(child);
+                    if (previous != null) previous.onChildViewAdded(parent, child);
+                }
+                @Override public void onChildViewRemoved(View parent, View child) {
+                    if (previous != null) previous.onChildViewRemoved(parent, child);
+                }
+            };
+            ((ViewGroup) list).setOnHierarchyChangeListener(listener);
+        } catch (Throwable ignored) { }
+    }
+
+    /** 对单个列表子项套用全部「我的」页卡片规则。 */
+    private static void filterMineChild(View child) {
+        if (child == null || child.getVisibility() == View.GONE) return;
+        try {
+            if (ON[I_RECOMMEND] && isRecommendCard(child)) {
+                child.setVisibility(View.GONE);
+                hit(Config.F_MINE_RECOMMEND);
+                return;
+            }
+            String title = textOf(child, ID[K_MINE_CARD_TITLE]);
+            if (title == null) return;
+            if (ON[I_CLEAN] && matchesAny(title, Config.MINE_CARD_LABELS_CLEAN)) {
+                child.setVisibility(View.GONE);
+                hit(Config.F_MINE_CLEAN);
+                return;
+            }
+            if (ON[I_HEALTH] && matchesAny(title, Config.MINE_CARD_LABELS_HEALTH)) {
+                child.setVisibility(View.GONE);
+                hit(Config.F_MINE_HEALTH);
+                return;
+            }
+            if (ON[I_BANNER] && matchesAny(title, Config.MINE_CARD_LABELS_BANNER)) {
+                child.setVisibility(View.GONE);
+                hit(Config.F_MINE_BANNER);
+            }
+        } catch (Throwable ignored) { }
+    }
+
+    /** 反射读 ViewGroup 已有的层级监听器，读不到就返回 null（降级直接挂）。 */
+    private static ViewGroup.OnHierarchyChangeListener readHierarchyListener(ViewGroup group) {
+        try {
+            java.lang.reflect.Field field = ViewGroup.class.getDeclaredField("mOnHierarchyChangeListener");
+            field.setAccessible(true);
+            Object value = field.get(group);
+            return (value instanceof ViewGroup.OnHierarchyChangeListener)
+                    ? (ViewGroup.OnHierarchyChangeListener) value : null;
+        } catch (Throwable ignored) { return null; }
+    }
+
+    /**
+     * 顶部三宫格重排。
+     *
+     * 用户反馈的真问题：三个格子是等宽并排的（真机 bounds 48-376 / 377-704 / 704-1032），
+     * 隐藏中间的「应用卸载」后，左右两张卡各占 1/3 贴住两边，中间空一大块，
+     * 看着「不均匀、不居中」，两个 1px 分隔线还杵在那里。
+     *
+     * 做法：把该行里所有分隔线一并收掉，剩下的格子改成 width=0 + weight=1，
+     * 让它们平分整行。全部隐藏时不动，避免整行塌成 0 宽。
+     */
+    private static void rebalanceTopGrid(View decor) {
+        try {
+            View anchor = decor.findViewById(ID[K_MINE_UPGRADE]);
+            if (anchor == null) anchor = decor.findViewById(ID[K_MINE_UNINSTALL]);
+            if (anchor == null) anchor = decor.findViewById(ID[K_MINE_DOWNLOAD]);
+            if (anchor == null) return;
+            if (!(anchor.getParent() instanceof ViewGroup)) return;
+            ViewGroup row = (ViewGroup) anchor.getParent();
+
+            int visible = 0;
+            for (int i = 0; i < row.getChildCount(); i++) {
+                View child = row.getChildAt(i);
+                if (child != null && isGridSlot(child) && child.getVisibility() != View.GONE) visible++;
+            }
+            if (visible == 0) return;      // 整行都藏了就别动布局
+
+            // ConstraintLayout 的子项是按「约束 + 百分比宽度」定位的，
+            // 改 width 或加 weight 都不会让它重排（真机实测：改成定宽后两张卡直接重叠）。
+            // 正确做法是把可见的格子接成一条 chain，由 ConstraintLayout 自己平分。
+            java.util.List<View> slots = new java.util.ArrayList<View>();
+            for (int i = 0; i < row.getChildCount(); i++) {
+                View child = row.getChildAt(i);
+                if (child != null && isGridSlot(child) && child.getVisibility() != View.GONE) {
+                    slots.add(child);
+                }
+            }
+            for (int i = 0; i < row.getChildCount(); i++) {
+                View child = row.getChildAt(i);
+                if (child != null && isRowDivider(child) && child.getVisibility() != View.GONE) {
+                    child.setVisibility(View.GONE);       // 分隔线跟着一起收掉
+                }
+            }
+            chainEvenly(row, slots);
+        } catch (Throwable ignored) { }
+    }
+
+    /**
+     * 把可见格子接成一条 ConstraintLayout chain，让它们平分整行。
+     *
+     * 真机实测的关键事实：这一行的父容器是 androidx.constraintlayout.widget.ConstraintLayout，
+     * 子项宽度 1640（远大于行宽 984），靠「start/end 约束 + 百分比宽度」定位。
+     * 所以改 width、加 weight 都不管用（改完直接重叠成 48-1032 与 212-1032）。
+     * 唯一正确解法是重建约束，让 ConstraintLayout 自己按 chain 均分。
+     *
+     * androidx 的类不在编译用的 android.jar 里，只能反射读写 LayoutParams 的 public 字段；
+     * 任何一步读不到就整体放弃（保持原样），绝不留下错乱的布局。
+     */
+    private static final java.util.concurrent.atomic.AtomicInteger GRID_DIAG_COUNT =
+            new java.util.concurrent.atomic.AtomicInteger(0);
+
+    /** 目标 App 的 classloader；只用于反射第三方容器类，模块自身 loader 里没有它们。 */
+    private static volatile ClassLoader TARGET_LOADER;
+
+    private static void gridDiag(String message) {
+        if (GRID_DIAG_COUNT.getAndIncrement() >= 4) return;   // 别刷屏
+        noteStatic("grid diag: " + message);
+    }
+
+    private static void chainEvenly(ViewGroup row, java.util.List<View> slots) {
+        if (slots == null || slots.size() < 2) { gridDiag("slots=" + (slots == null ? 0 : slots.size())); return; }
+        try {
+            // 必须用目标 App 的 classloader：模块自身 loader 里没有 androidx.constraintlayout
+            ClassLoader owner = TARGET_LOADER;
+            if (owner == null) { gridDiag("no target classloader"); return; }
+            Class<?> clp = Class.forName(
+                    "androidx.constraintlayout.widget.ConstraintLayout$LayoutParams", false, owner);
+            android.view.ViewGroup.LayoutParams first = slots.get(0).getLayoutParams();
+            gridDiag("rowClass=" + row.getClass().getName()
+                    + " lpClass=" + (first == null ? "null" : first.getClass().getName())
+                    + " isCLP=" + (first != null && clp.isInstance(first))
+                    + " fields=startToStart:" + hasField(clp, "startToStart")
+                    + ",endToEnd:" + hasField(clp, "endToEnd")
+                    + ",startToEnd:" + hasField(clp, "startToEnd")
+                    + ",endToStart:" + hasField(clp, "endToStart")
+                    + ",widthPercent:" + hasField(clp, "widthPercent")
+                    + ",width:" + hasField(clp, "width"));
+            java.lang.reflect.Field fStartToStart = clp.getField("startToStart");
+            java.lang.reflect.Field fEndToEnd = clp.getField("endToEnd");
+            java.lang.reflect.Field fStartToEnd = clp.getField("startToEnd");
+            java.lang.reflect.Field fEndToStart = clp.getField("endToStart");
+            java.lang.reflect.Method mWidthPercent = null;
+            try { mWidthPercent = clp.getMethod("setWidthPercent", float.class); } catch (Throwable ignored) { }
+            java.lang.reflect.Field fWidth = clp.getField("width");
+            java.lang.reflect.Field fBias = clp.getField("horizontalBias");
+
+            final int PARENT = 0;          // ConstraintLayout.LayoutParams.PARENT_ID
+            for (int i = 0; i < slots.size(); i++) {
+                View slot = slots.get(i);
+                android.view.ViewGroup.LayoutParams raw = slot.getLayoutParams();
+                if (raw == null || !clp.isInstance(raw)) { gridDiag("bail at slot " + i); return; }
+                int prevId = (i > 0) ? slots.get(i - 1).getId() : PARENT;
+                int nextId = (i < slots.size() - 1) ? slots.get(i + 1).getId() : PARENT;
+
+                fStartToStart.setInt(raw, i == 0 ? PARENT : -1);
+                fStartToEnd.setInt(raw, i == 0 ? -1 : prevId);
+                fEndToStart.setInt(raw, i == slots.size() - 1 ? -1 : nextId);
+                fEndToEnd.setInt(raw, i == slots.size() - 1 ? PARENT : -1);
+                if (mWidthPercent != null) mWidthPercent.invoke(raw, 0f);   // 0 = 不按百分比
+                fWidth.setInt(raw, 0);                // 0 = MATCH_CONSTRAINT
+                fBias.setFloat(raw, 0.5f);
+                slot.setLayoutParams(raw);
+            }
+            row.requestLayout();
+            gridDiag("chained " + slots.size() + " slots");
+        } catch (Throwable error) { gridDiag("failed: " + describe(error)); }
+    }
+
+    private static String hasField(Class<?> type, String name) {
+        try { type.getField(name); return "y"; }
+        catch (Throwable ignored) { return "n"; }
+    }
+
+    private static boolean isGridSlot(View view) {
+        if (view == null) return false;
+        int id = view.getId();
+        return id != 0 && (id == ID[K_MINE_UPGRADE] || id == ID[K_MINE_UNINSTALL]
+                || id == ID[K_MINE_DOWNLOAD]);
+    }
+
+    /** 该行里 id 名以 line 开头的 1px 分隔线；只看本行的子项，不会误伤别的卡片。 */
+    private static boolean isRowDivider(View view) {
+        try {
+            if (view == null || view.getId() == 0) return false;
+            if (isGridSlot(view)) return false;
+            String name = view.getResources().getResourceEntryName(view.getId());
+            return name != null && name.startsWith("line");
+        } catch (Throwable ignored) { return false; }
+    }
+
+    // ══════════════════════ 资源 id 解析 ══════════════════════
+
+    // K_* 是 ID[] 的下标
+    private static final int K_BOTTOM_TAB = 0;
+    private static final int K_BOTTOM_NAV = 1;
+    private static final int K_FLOAT_AD = 2;
+    private static final int K_MINE_UPGRADE = 3;
+    private static final int K_MINE_UNINSTALL = 4;
+    private static final int K_MINE_DOWNLOAD = 5;
+    private static final int K_MINE_CLEAN = 6;
+    private static final int K_MINE_HEALTH = 7;
+    private static final int K_MINE_BANNER = 8;
+    private static final int K_MINE_INDIC = 9;
+    private static final int K_MINE_VIP = 10;
+    private static final int K_MINE_LIST = 11;
+    private static final int K_TAB_LABEL_LARGE = 12;
+    private static final int K_TAB_LABEL_SMALL = 13;
+    private static final int K_MINE_CARD_TITLE = 14;
+    private static final int K_MINE_REC_CARD = 15;
+    private static final int K_MINE_REC_ITEM = 16;
+    private static final int K_MINE_REC_RATING = 17;
+    private static final int ID_COUNT = 18;
+
+    private static final String[] ID_NAMES = {
+            Config.ID_BOTTOM_TAB, Config.ID_BOTTOM_NAV, Config.ID_FLOAT_AD,
+            Config.ID_MINE_UPGRADE, Config.ID_MINE_UNINST, Config.ID_MINE_DOWN,
+            Config.ID_MINE_CLEAN, Config.ID_MINE_HEALTH, Config.ID_MINE_BANNER,
+            Config.ID_MINE_INDIC, Config.ID_MINE_VIP, Config.ID_MINE_LIST,
+            Config.ID_TAB_LABEL_LARGE, Config.ID_TAB_LABEL_SMALL,
+            Config.ID_MINE_CARD_TITLE, Config.ID_MINE_REC_CARD,
+            Config.ID_MINE_REC_ITEM, Config.ID_MINE_REC_RATING,
+    };
+    private static final int[] ID = new int[ID_COUNT];
+    private static volatile boolean idsResolved;
+
+    /** 底栏的两个文案 id 单独解析（供 Config 里的名字 -> 运行期 id 用）。 */
+    static int tabLabelLargeId() { return ID[K_TAB_LABEL_LARGE]; }
+    static int tabLabelSmallId() { return ID[K_TAB_LABEL_SMALL]; }
+
+    private void resolveIds(Context context) {
+        Resources resources;
+        try { resources = context.getResources(); }
+        catch (Throwable error) { log(Log.WARN, TAG, "resources unavailable", error); return; }
+        int found = 0;
+        for (int i = 0; i < ID_COUNT; i++) {
+            try { ID[i] = resources.getIdentifier(ID_NAMES[i], "id", Config.TARGET); }
+            catch (Throwable ignored) { ID[i] = 0; }
+            if (ID[i] != 0) found++;
+        }
+        idsResolved = true;
+        log(Log.INFO, TAG, "resource ids resolved: " + found + "/" + ID_COUNT);
+        note("resource ids resolved: " + found + "/" + ID_COUNT + " "
+                + (found == ID_COUNT ? "complete" : "PARTIAL: some features will fall back"));
+    }
+
+    /** 某个特性依赖的资源 id 是否齐备 —— UI 类规则的 matched / partial / miss 依据。 */
+    private String uiState(String feature, int[] required) {
+        if (!idsResolved) return "miss";
+        int have = 0;
+        StringBuilder missing = new StringBuilder();
+        for (int i = 0; i < required.length; i++) {
+            if (ID[required[i]] != 0) have++;
+            else missing.append(ID_NAMES[required[i]]).append(' ');
+        }
+        if (have == required.length) return "matched";
+        if (have == 0) { probeFailure = "未找到 id: " + missing.toString().trim(); return "miss"; }
+        probeFailure = "部分 id 缺失: " + missing.toString().trim();
+        probePartial = true;
+        return "partial";
+    }
+
+    // ══════════════════════ 反射工具（安装期一次，运行期零反射） ══════════════
+
+    private static Class<?> load(ClassLoader loader, String name) throws ClassNotFoundException {
+        return loader.loadClass(name);
+    }
+
+    /** 严格签名校验：名字对了但签名不对 => 当作没找到，绝不硬 hook。 */
+    private Method requireMethod(Class<?> owner, String name, String returnName, String[] paramNames)
+            throws Exception {
+        Class<?>[] params = resolveShape(owner.getClassLoader(), paramNames);
+        Method method = owner.getDeclaredMethod(name, params);
+        if (!matches(method, returnName, params)) {
+            throw new NoSuchMethodException("unexpected signature: " + method);
+        }
+        return method;
+    }
+
+    /**
+     * 名字可能被 R8 改名时用：按「形状」在类里唯一命中才算数（歧义即失败）。
+     * 这是多版本自适配的第二层（第一层是已知名直取）。
+     */
+    private Method findByNamePrefix(Class<?> owner, String namePrefix, String returnName, int paramCount)
+            throws Exception {
+        Method found = null;
+        for (Method candidate : owner.getDeclaredMethods()) {
+            if (!candidate.getName().startsWith(namePrefix)) continue;
+            if (candidate.getReturnType() != resolveOne(owner.getClassLoader(), returnName)) continue;
+            if (candidate.getParameterTypes().length != paramCount) continue;
+            if (found != null) throw new NoSuchMethodException("ambiguous candidates for " + namePrefix);
+            found = candidate;
+        }
+        if (found == null) throw new NoSuchMethodException("no " + namePrefix + " in " + owner.getName());
+        return found;
+    }
+
+    private static boolean matches(Method method, String returnName, Class<?>[] params) {
+        try {
+            if (method.getReturnType() != resolveOne(method.getDeclaringClass().getClassLoader(), returnName)) {
+                return false;
+            }
+        } catch (Throwable ignored) { return false; }
+        Class<?>[] actual = method.getParameterTypes();
+        if (actual.length != params.length) return false;
+        for (int i = 0; i < actual.length; i++) if (actual[i] != params[i]) return false;
+        return true;
+    }
+
+    private static Class<?>[] resolveShape(ClassLoader loader, String[] names) throws ClassNotFoundException {
+        Class<?>[] out = new Class<?>[names.length];
+        for (int i = 0; i < names.length; i++) out[i] = resolveOne(loader, names[i]);
+        return out;
+    }
+
+    private static Class<?> resolveOne(ClassLoader loader, String name) throws ClassNotFoundException {
+        if ("boolean".equals(name)) return boolean.class;
+        if ("byte".equals(name)) return byte.class;
+        if ("char".equals(name)) return char.class;
+        if ("short".equals(name)) return short.class;
+        if ("int".equals(name)) return int.class;
+        if ("long".equals(name)) return long.class;
+        if ("float".equals(name)) return float.class;
+        if ("double".equals(name)) return double.class;
+        if ("void".equals(name)) return void.class;
+        return loader.loadClass(name);
+    }
+
+    // ══════════════════════ 探针与上报 ══════════════════════
+
+    private boolean probePartial;
+
+    /** 允许抛受检异常的安装动作（反射查找必然要处理受检异常）。 */
+    private interface ThrowingRunnable { void run() throws Exception; }
+
+    /** action 为 null 表示这个特性不装 hook；异常一律折算成 miss，绝不外泄。 */
+    private void probe(String feature, boolean enabled, ThrowingRunnable action) {
+        probeFailure = null;
+        probePartial = false;
+        if (enabled) {
+            try {
+                if (action != null) action.run();
+                else probeFailure = null;
+            } catch (Throwable error) {
+                probeFailure = error.toString();
+                log(Log.WARN, TAG, feature + " probe failed", error);
+            }
+        }
+        String state;
+        if (!enabled) state = "off";
+        else if (probeFailure != null) state = "miss";
+        else if (probePartial) state = "partial";
+        else state = "matched";
+        reportDone++;
+        report("running", feature, state, probeFailure == null ? "" : probeFailure);
+        String line = "feature=" + feature + " result=" + state
+                + (probeFailure == null ? "" : " why=" + probeFailure);
+        log(Log.INFO, TAG, line);
+        trace(line);
+    }
+
+    /** UI 类特性在 id 解析之后单独判定（这样 partial 的原因能报出来）。 */
+    private void probeUi(String feature, int... required) {
+        if (!ON[Config.indexOf(feature)]) { probe(feature, false, null); return; }
+        String state = uiState(feature, required);
+        reportDone++;
+        report("running", feature, state, probeFailure == null ? "" : probeFailure);
+        String line = "feature=" + feature + " result=" + state
+                + (probeFailure == null ? "" : " why=" + probeFailure);
+        log(Log.INFO, TAG, line);
+        trace(line);
+    }
+
+    /** 上报到设置页；失败不影响目标 App。 */
+    private void report(String phase, String feature, String state, String detail) {
+        if (!feature.isEmpty() && !state.isEmpty()) {
+            states.put(feature, state);
+            details.put(feature, detail);
+        }
+        if (reportContext == null) return;
+        try {
+            Bundle extras = new Bundle();
+            extras.putString("token", reportToken);
+            extras.putLong("run", reportRun);
+            extras.putString("phase", phase);
+            extras.putInt("done", reportDone);
+            extras.putInt("total", Config.FEATURES.length);
+            extras.putString("feature", feature);
+            extras.putString("state", state);
+            extras.putString("detail", detail.length() > 180 ? detail.substring(0, 180) : detail);
+            Intent intent = new Intent(REPORT_ACTION);
+            // 收件人必须是模块自己的组件：目标进程里 getPackageName() 返回的是目标包名
+            intent.setComponent(new ComponentName(Config.MODULE, REPORT_RECEIVER));
+            intent.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
+            intent.putExtras(extras);
+            if (Build.VERSION.SDK_INT >= 34) {
+                Bundle options = BroadcastOptions.makeBasic().setShareIdentityEnabled(true).toBundle();
+                reportContext.sendBroadcast(intent, null, options);
+            } else {
+                reportContext.sendBroadcast(intent);
+            }
+        } catch (Throwable error) { log(Log.WARN, TAG, "status report unavailable", error); }
+    }
+}
