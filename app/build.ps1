@@ -8,13 +8,13 @@ param([switch]$KeepBuildDirectory)
 # Keep all Chinese text in the skill docs, not in this script.
 $ErrorActionPreference = 'Stop'
 
-$VERSION = '0.2.0'
+$VERSION = '0.3.0'
 # Module self-reported versionCode. Declared HERE, next to $VERSION, on purpose:
 # the APK file name, module.prop's version= and versionCode= used to be three
 # hand-maintained values that could drift apart, which is how a fixed build
 # ended up still shipping under the label of the buggy one. build.ps1 now
 # injects both into module.prop, so bumping the version is a one-line change.
-$VERSION_CODE = 2
+$VERSION_CODE = 3
 
 $app = $PSScriptRoot
 # Toolchain paths. Each can be overridden by an environment variable so the
