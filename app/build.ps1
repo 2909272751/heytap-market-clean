@@ -9,6 +9,12 @@ param([switch]$KeepBuildDirectory)
 $ErrorActionPreference = 'Stop'
 
 $VERSION = '0.2.0'
+# Module self-reported versionCode. Declared HERE, next to $VERSION, on purpose:
+# the APK file name, module.prop's version= and versionCode= used to be three
+# hand-maintained values that could drift apart, which is how a fixed build
+# ended up still shipping under the label of the buggy one. build.ps1 now
+# injects both into module.prop, so bumping the version is a one-line change.
+$VERSION_CODE = 2
 
 $app = $PSScriptRoot
 # Toolchain paths. Each can be overridden by an environment variable so the
@@ -57,6 +63,18 @@ foreach ($folder in @('stub-src', 'src', 'res', 'META-INF', 'libs')) {
     if (Test-Path -LiteralPath $from) { Copy-Item -LiteralPath $from -Destination $stage -Recurse -Force }
 }
 Copy-Item -LiteralPath (Join-Path $app 'AndroidManifest.xml') -Destination $stage
+
+# Inject the version into module.prop so the APK file name and the version the
+# module reports inside the framework can never disagree.
+$moduleProp = Join-Path $stage 'META-INF\xposed\module.prop'
+if (Test-Path -LiteralPath $moduleProp) {
+    $prop = [IO.File]::ReadAllText($moduleProp, [Text.Encoding]::UTF8)
+    $prop = [regex]::Replace($prop, '(?m)^version=.*$', "version=$VERSION")
+    $prop = [regex]::Replace($prop, '(?m)^versionCode=.*$', "versionCode=$VERSION_CODE")
+    [IO.File]::WriteAllText($moduleProp, $prop, (New-Object Text.UTF8Encoding($false)))
+    Write-Host "module.prop -> version=$VERSION versionCode=$VERSION_CODE"
+}
+
 foreach ($folder in @('stubs', 'classes', 'dex', 'out')) {
     New-Item -ItemType Directory -Path (Join-Path $stage $folder) -Force | Out-Null
 }
