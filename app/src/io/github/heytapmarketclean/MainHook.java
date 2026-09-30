@@ -3,6 +3,9 @@ package io.github.heytapmarketclean;
 import android.app.Activity;
 import android.app.Application;
 import android.app.BroadcastOptions;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
@@ -21,6 +24,7 @@ import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
 import java.lang.reflect.Method;
+import java.lang.reflect.Field;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -101,6 +105,15 @@ public final class MainHook extends XposedModule {
     private static final int I_BANNER = Config.indexOf(Config.F_MINE_BANNER);
     private static final int I_RECOMMEND = Config.indexOf(Config.F_MINE_RECOMMEND);
     private static final int I_VIP = Config.indexOf(Config.F_MINE_VIP);
+
+    // 通知类。Config.CHANNEL_MATCH 的第 i 项对应 I_NOTI_BASE + i，两处必须同步改。
+    private static final int I_NOTI_RECOMMEND = Config.indexOf(Config.F_NOTI_RECOMMEND);
+    private static final int I_NOTI_BASE = I_NOTI_RECOMMEND;
+    private static final int I_NOTI_PUSH_HIGH = Config.indexOf(Config.F_NOTI_PUSH_HIGH);
+    private static final int I_NOTI_TOOL      = Config.indexOf(Config.F_NOTI_TOOL);
+    private static final int I_NOTI_UPGRADE   = Config.indexOf(Config.F_NOTI_UPGRADE);
+    private static final int I_NOTI_SELF      = Config.indexOf(Config.F_NOTI_SELF);
+    private static final int I_NOTI_SCAN      = Config.indexOf(Config.F_NOTI_SCAN);
 
     /** 每次触达界面后的补隐藏时刻（有限次、随事件触发，不是轮询）。 */
     /**
@@ -206,6 +219,18 @@ public final class MainHook extends XposedModule {
             HITS = new java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicBoolean>();
 
     private static final AtomicBoolean STATES_DUMPED = new AtomicBoolean(false);
+
+    /** 通知规则：每条只允许打一次日志（避免一天几十条通知刷爆 logcat，也避免热路径拼串）。 */
+    private static final AtomicBoolean[] notiLogged = newLogGates();
+    /** 通知侦察的「有未拦截的推送经过」也只打一次。 */
+    private static final AtomicBoolean SCAN_ONCE = new AtomicBoolean(false);
+
+    private static AtomicBoolean[] newLogGates() {
+        int n = Config.FEATURES.length;
+        AtomicBoolean[] a = new AtomicBoolean[n];
+        for (int i = 0; i < n; i++) a[i] = new AtomicBoolean(false);
+        return a;
+    }
 
     /**
      * 特性 -> 实际 hook 到的方法签名。
@@ -411,7 +436,18 @@ public final class MainHook extends XposedModule {
         trace(line);
         if (!Config.TARGET.equals(packageName)) return;
         if (process != null && !Config.TARGET.equals(process)) {
-            log(Log.INFO, TAG, "skip: secondary process " + process);
+            // 子进程一律不装 UI/广告钩子（界面规则在子进程里毫无意义，
+            // 还要额外付出类加载与 Context 初始化）。
+            // 例外：推送通知很可能就是从 :rhea（OPPO 推送 SDK）/ :background 发出来的，
+            // 只在主进程拦 notify 会一条都拦不到，所以这两个进程只装**通知**钩子。
+            if (Config.isNotifyProcess(process)) {
+                log(Log.INFO, TAG, "secondary process accepted for notification gate: " + process);
+                if (!installed.compareAndSet(false, true)) return;
+                if (loader == null) { log(Log.INFO, TAG, "classloader not ready, deferring"); return; }
+                installNotificationOnly(loader, process);
+            } else {
+                log(Log.INFO, TAG, "skip: secondary process " + process);
+            }
             return;
         }
         if (!installed.compareAndSet(false, true)) return;
@@ -421,6 +457,19 @@ public final class MainHook extends XposedModule {
             return;
         }
         armContextHook(loader);
+    }
+
+    /**
+     * 只装通知闸门（不碰界面、不碰广告），用于推送所在的子进程。
+     *
+     * 这里连 Context 钩子都不挂：通知规则完全靠方法形状匹配，
+     * 不需要 App 的任何上下文，开销就是几个方法的 hook。
+     */
+    private void installNotificationOnly(ClassLoader loader, String process) {
+        try { installNotificationGate(loader, process, null); }
+        catch (Throwable error) {
+            log(Log.WARN, TAG, "notification gate unavailable in " + process, error);
+        }
     }
 
     /** 只读一次，用于把「框架到底支持到第几代 API」写进日志，省得下次再猜。 */
@@ -534,6 +583,10 @@ public final class MainHook extends XposedModule {
         probe(Config.F_MSP_AD, ON[I_MSP], new ThrowingRunnable() {
             @Override public void run() throws Exception { installMspAdGate(loader); }
         });
+        try { installNotificationGate(loader, Config.TARGET, context); }
+        catch (Throwable error) {
+            log(Log.WARN, TAG, "notification gate unavailable", error);
+        }
         if (ON[I_BOTTOM]) {
             try { installBottomBarPrune(loader); }
             catch (Throwable error) {
@@ -1252,6 +1305,144 @@ public final class MainHook extends XposedModule {
             android.view.ViewParent parent = view.getParent();
             if (parent instanceof View) applyRulesToRoot((View) parent);
         } catch (Throwable ignored) { }
+    }
+
+    /**
+     * 通知闸门：按通道 id 拦下营销类推送，并在开关打开时记录 App 实际推送的通道。
+     *
+     * ── 为什么拦 notify 而不靠关权限 ──
+     * 关掉 `POST_NOTIFICATIONS` 或把通道设为「无」是一刀切，会把
+     * **下载任务 / 安装完成 / 更新完成**一起弄没——那三条是用户自己点了才产生的，
+     * 误伤代价比多一条通知大得多。所以在 `notify()` 这一步按通道分流：
+     * 命中的直接**不 proceed**，通知根本不会走到 system_server。
+     *
+     * ── 成本（这是本模块里最便宜的一处钩子）──
+     *  - `notify` 一天被调的次数是**个位数到几十次**，不是 per-frame；
+     *  - 拦截器里只有：读一个安装期就解析好的 Field → 一次 5 元素线性子串比对
+     *    （`String.contains` 不分配）→ 不中就 proceed 返回。零分配、零反射、零正则；
+     *  - 日志**每条规则只打一次**（CAS 门），之后完全静默；
+     *  - 没有定时器、没有轮询、没有后台常驻。
+     *  作为对照：模块里最贵的是 `ViewGroup.addView`（每次布局填充调上千次），
+     *  通知钩子比它便宜几个数量级。而拦掉一条 importance=4 的推送
+     *  省下的是震动/响铃/亮屏——那才是真正的耗电大头。
+     *
+     * @param ctx 非 null 时（仅主进程）做一次通道枚举侦察；子进程传 null
+     */
+    private void installNotificationGate(ClassLoader loader, String process, Context ctx) throws Exception {
+        // Notification.mChannelId 是隐藏字段，API 26+ 才有。安装期解析一次，运行期零反射。
+        Field channelId = null;
+        try { channelId = Notification.class.getDeclaredField("mChannelId"); channelId.setAccessible(true); }
+        catch (Throwable ignored) { }
+        final Field F_CHANNEL = channelId;
+        if (F_CHANNEL == null) throw new NoSuchFieldException("Notification.mChannelId");
+
+        int hooked = 0;
+        for (Method m : NotificationManager.class.getMethods()) {
+            if (!"notify".equals(m.getName())) continue;
+            Class<?>[] p = m.getParameterTypes();
+            // 两个重载都要抓：notify(int, Notification) 和 notify(String, int, Notification)。
+            // 早先只按「长度==2」筛，把带 tag 的那个（三参）漏掉了，
+            // 结果推送 SDK 走的那条路径一次都没被拦。
+            boolean plain = (p.length == 2 && p[0] == int.class && p[1] == Notification.class);
+            boolean tagged = (p.length == 3 && p[0] == String.class && p[1] == int.class
+                    && p[2] == Notification.class);
+            if (!plain && !tagged) continue;
+            // Notification 参数的下标：notify(int, Notification) 是 1，
+            // notify(String, int, Notification) 是 2。写死 1 会把 int 的 id 当成通知对象。
+            final int argIndex = plain ? 1 : 2;
+            m.setAccessible(true);
+            hook(m).setId(Config.MODULE + "_noti_block").intercept(new XposedInterface.Hooker() {
+                @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                    Object n = chain.getArg(argIndex);
+                    String cid = channelIdOf(n, F_CHANNEL);
+                    int idx = matchChannel(cid);
+                    if (idx >= 0 && ON[idx]) {
+                        if (hitOnce(idx)) {
+                            noteStatic("noti blocked: " + Config.FEATURES[idx] + " channel=" + cid
+                                    + " proc=" + process + " title=" + titleOf(n));
+                        }
+                        return null;                    // 不 proceed = 真拦截
+                    }
+                    if (idx >= 0 && ON[I_NOTI_SCAN] && SCAN_ONCE.compareAndSet(false, true)) {
+                        noteStatic("noti passthru: " + Config.FEATURES[idx] + " channel=" + cid + " proc=" + process);
+                    }
+                    return chain.proceed();
+                }
+            });
+            hooked++;
+        }
+        if (hooked == 0) throw new NoSuchMethodException("NotificationManager.notify not found");
+
+        if (ctx != null && ON[I_NOTI_SCAN]) scanExistingChannels(ctx);
+        log(Log.INFO, TAG, "notification gate: " + hooked + " notify() overload(s), process=" + process);
+    }
+
+    /** 读通道 id；拿不到返回 null（pre-O 的通知没有通道），调用方按 null 处理。 */
+    private static String channelIdOf(Object notification, Field f) {
+        if (notification == null || f == null) return null;
+        try { return (String) f.get(notification); }
+        catch (Throwable ignored) { return null; }
+    }
+
+    /**
+     * 通道 id → 特性下标。线性扫 5 个短串，不中返回 -1。
+     * 特征串见 Config.CHANNEL_MATCH（用的是资源名的辨识部分，不是包名全串，
+     * 因为推送 SDK 那条是「包名 + 资源名」拼出来的）。
+     */
+    private static int matchChannel(String cid) {
+        if (cid == null || cid.length() == 0) return -1;
+        for (int i = 0; i < Config.CHANNEL_MATCH.length; i++) {
+            if (cid.contains(Config.CHANNEL_MATCH[i])) return I_NOTI_BASE + i;
+        }
+        return -1;
+    }
+
+    /** 每条规则只允许打一次日志（CAS 门），避免高频重复输出。 */
+    private static boolean hitOnce(int featureIndex) {
+        try {
+            if (notiLogged[featureIndex].compareAndSet(false, true)) return true;
+        } catch (Throwable ignored) { }
+        return false;
+    }
+
+    /** 通知标题：只在真的要打日志时才取（.toString() 会分配，所以放在 CAS 之后）。 */
+    private static String titleOf(Object notification) {
+        try {
+            if (!(notification instanceof Notification)) return "";
+            Bundle extras = ((Notification) notification).extras;
+            if (extras == null) return "";
+            CharSequence t = extras.getCharSequence(Notification.EXTRA_TITLE);
+            return t == null ? "" : String.valueOf(t);
+        } catch (Throwable ignored) { return ""; }
+    }
+
+    /**
+     * 通知侦察：启动时把 App **已经建好**的通道全列一遍。
+     * 这是「查询推送总类」最直接的办法——不用等新通知到达。
+     * 只在主进程、只在开关打开时跑一次。
+     */
+    private void scanExistingChannels(Context ctx) {
+        if (ctx == null) return;
+        try {
+            android.app.NotificationManager nm =
+                    (android.app.NotificationManager) ctx.getSystemService(android.content.Context.NOTIFICATION_SERVICE);
+            if (nm == null) return;
+            java.util.List<NotificationChannel> list = nm.getNotificationChannels();
+            if (list == null) return;
+            int covered = 0;
+            for (int i = 0; i < list.size(); i++) {
+                NotificationChannel c = list.get(i);
+                String cid = c.getId();
+                int idx = matchChannel(cid);
+                if (idx >= 0) covered++;
+                noteStatic("noti_channel: id=" + cid + " name=" + c.getName()
+                        + " importance=" + c.getImportance()
+                        + " covered=" + (idx >= 0 ? Config.FEATURES[idx] : "-"));
+            }
+            noteStatic("noti_scan: channels=" + list.size() + " covered=" + covered);
+        } catch (Throwable error) {
+            log(Log.WARN, TAG, "notification scan failed", error);
+        }
     }
 
     private static void applyRules(Activity activity) {

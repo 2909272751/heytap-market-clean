@@ -18,7 +18,7 @@ final class Config {
      * 规则结构版本：只有规则语义变化时才 +1（会让锚点缓存失效重探）。
      */
     /** 规则结构版本：规则语义变了就 +1，缓存 token 随之失效、重新探测。 */
-    static final String SCHEMA = "6";
+    static final String SCHEMA = "7";
 
     /** RemotePreferences 组名。 */
     static final String GROUP = "io.github.heytapmarketclean_settings";
@@ -40,12 +40,19 @@ final class Config {
     static final String F_MINE_BANNER    = "mine_banner";     // 热门好礼横幅
     static final String F_MINE_RECOMMEND = "mine_recommend";  // 继续探索推荐卡
     static final String F_MINE_VIP       = "mine_vip";        // 游戏 VIP 卡
+    static final String F_NOTI_RECOMMEND = "noti_recommend";  // 热门内容推荐推送
+    static final String F_NOTI_PUSH_HIGH = "noti_push_high";  // 热门内容推送（高优先级）
+    static final String F_NOTI_TOOL      = "noti_tool";       // 应用运行状态提示（加速推广）
+    static final String F_NOTI_UPGRADE   = "noti_upgrade";    // 可更新应用提醒
+    static final String F_NOTI_SELF      = "noti_self";       // 商店自身更新进度
+    static final String F_NOTI_SCAN      = "noti_scan";       // 通知侦察（记录所有推送）
 
     static final String[] FEATURES = {
             F_FLOAT_AD, F_AI_BUBBLE, F_CTA_DIALOG, F_MSP_AD, F_BOOT_GUIDE,
             F_BOTTOM_BAR, F_TOP_BANNER, F_NAV_BADGE,
             F_MINE_UPGRADE, F_MINE_UNINSTALL, F_MINE_DOWNLOAD,
             F_MINE_CLEAN, F_MINE_HEALTH, F_MINE_BANNER, F_MINE_RECOMMEND, F_MINE_VIP,
+            F_NOTI_RECOMMEND, F_NOTI_PUSH_HIGH, F_NOTI_TOOL, F_NOTI_UPGRADE, F_NOTI_SELF, F_NOTI_SCAN,
     };
 
     static final String[] FEATURE_LABELS = {
@@ -53,6 +60,8 @@ final class Config {
             "底栏推广入口", "顶部横幅推广位", "底栏红点角标",
             "待更新", "应用卸载", "下载管理",
             "存储空间清理", "应用健康状态", "热门好礼横幅", "“继续探索”推荐卡", "游戏 VIP 卡",
+            "热门内容推荐推送", "热门内容推送（高优先级）", "应用运行状态提示",
+            "可更新应用提醒", "商店自身更新进度", "通知侦察（记录全部推送）",
     };
 
     /** 每一项都必须写清「对应页面」——用户要求一眼看出改的是哪个界面。 */
@@ -73,6 +82,12 @@ final class Config {
             "我的 · 热门好礼免费领横幅",
             "我的 · “在这里，继续探索”推荐卡",
             "我的 · 登录/游戏 VIP 头部卡",
+            "系统通知栏（锁屏/桌面下拉）里的推荐广告",
+            "系统通知栏里的热门内容推送（importance=4，会震动/响铃）",
+            "系统通知栏里的加速/清理推广提示",
+            "系统通知栏里的“有 N 个应用可更新”提醒",
+            "系统通知栏里软件商店自己更新时的进度条",
+            "不拦截任何通知，只把实际出现的通道与标题记进日志",
     };
 
     static final String[] FEATURE_NOTES = {
@@ -92,26 +107,101 @@ final class Config {
             "按资源 id scroll_banner + banner_indicator 隐藏",
             "按结构识别（卡片内含 HorizontalAppItemView）隐藏",
             "按资源 id vip_layout 隐藏",
+            "闸门：NotificationManager.notify 按通道 id 拦截（platform_recommend_push_notification）",
+            "闸门：同上，拦推送 SDK 家族的 com.heytap.marketpush_noti_high（importance=4）",
+            "闸门：同上，拦 platform_tool_notification（加速/清理推广）",
+            "闸门：同上，拦 platform_check_updates_notification",
+            "闸门：同上，拦 platform_self_updated_progress_notification",
+            "启动时枚举 getNotificationChannels() 并逐条打日志；每次 notify 记录通道与标题。不改变任何通知行为",
     };
 
-    /** 0=广告拦截 1=界面 2=我的页面 */
+    /** 0=广告拦截 1=界面 2=我的页面 3=通知 */
     static final int[] FEATURE_CATEGORY = {
             0, 0, 0, 0, 0, 1, 0, 1, 2, 2, 2, 2, 2, 2, 2, 2,
+            3, 3, 3, 3, 3, 3,
     };
 
-    static final String[] CATEGORIES = {"广告拦截", "界面", "我的页面"};
+    static final String[] CATEGORIES = {"广告拦截", "界面", "我的页面", "通知"};
 
     /**
      * 默认值：广告类默认开；「我的」页按用户逐项勾选的结果开
      * （会员 VIP、卸载/空间清理、健康、热门好礼横幅、继续探索推荐卡 = 开；
      *   待更新、下载管理 = 关）。
+     * 通知类只默认关**营销**的三类；可更新应用提醒 / 商店自身更新 = 关（用户可自行打开）。
+     * 下载任务、安装完成、更新完成这三类是**用户主动行为**产生的，一概不拦，
+     * 所以根本不给开关——误伤代价比多一条通知大得多。
      */
     static final boolean[] FEATURE_DEFAULT = {
             true, true, true, true, true, true, true, true,
             false, true, false, true, true, true, true, true,
+            true, true, true, false, false, true,
     };
 
     static String key(String feature) { return feature + "_enabled"; }
+
+    // ── 通知拦截 ────────────────────────────────────────────────────────────
+    /**
+     * 推送所在（且只）需要装通知闸门的子进程。
+     *
+     * 26.5.2_CN 清单实测共 11 个子进程：`:restart :track :recovery :rhea :media
+     * :hlog :background ×3 :tbl_privileged_process0..4 :tbl_sandboxed_process0`。
+     * 只挑其中最可能发通知的两个：
+     *  - `:rhea`       —— OPPO 推送 SDK（Rhea）的宿主进程
+     *  - `:background` —— 后台任务聚合，App 常用它在后台发通知
+     * 其余一律跳过，避免为一个通知规则让模块在 11 个进程里都加载一遍。
+     */
+    static final String[] NOTIFY_PROCESSES = {":rhea", ":background"};
+
+    /**
+     * 进程名是否需要装通知闸门。
+     *
+     * ⚠️ `processName` 给的是**全名**（`com.heytap.market:rhea`），不是 `:rhea`。
+     * 早先直接拿 `":rhea"` 去 equals，日志实测为
+     * `skip: secondary process com.heytap.market:rhea` —— 一次都没命中。
+     * 所以比**后缀**。包名已在上游门闸比过，这里不会误匹配别的包。
+     */
+    static boolean isNotifyProcess(String process) {
+        if (process == null) return false;
+        for (int i = 0; i < NOTIFY_PROCESSES.length; i++) {
+            if (process.endsWith(NOTIFY_PROCESSES[i])) return true;
+        }
+        return false;
+    }
+
+    /**
+     * 通道 id 特征串 → FEATURES 下标。
+     *
+     * 实测到的真实通道 id（`dumpsys notification` + aapt2 资源表）：
+     *   platform_recommend_push_notification          热门内容推荐      ← 广告
+     *   com.heytap.marketpush_noti_high               热门内容推送      ← 广告，importance=4
+     *   platform_tool_notification                    应用运行状态提示  ← 加速/清理推广
+     *   platform_check_updates_notification           可更新应用
+     *   platform_self_updated_progress_notification   商店自身更新
+     *   platform_download_task_notification           下载任务          ← 用户主动，不拦
+     *   platform_installed_notification               安装完成          ← 用户主动，不拦
+     *   platform_updated_notification                 更新完成          ← 用户主动，不拦
+     *
+     * 实测到的真实通道（26.5.2_CN 真机 `getNotificationChannels()`，v0.6.0 侦察功能输出）：
+     *   Foreground_Channel_Id              核心服务      importance=3   前台服务，不拦
+     *   com.heytap.marketpush_noti_high    热门内容推送   importance=4   ★营销，已覆盖
+     *   download_task_notify_channel_id    下载任务提醒   importance=3   用户主动，不拦
+     *
+     * ⚠️ **运行期通道 id 和 dex 里的资源名不是一回事**，这个坑是侦察功能实测出来的：
+     *   资源 `platform_download_task_notification` → 运行期 `download_task_notify_channel_id`
+     *   资源 `platform_recommend_push_notification` → 推送 SDK 走的是 `com.heytap.marketpush_noti_high`
+     * 所以特征串取的是**去包名、去前缀后的辨识部分**，两种命名形态都能命中；
+     * 没命中的通道会照实打在 `noti_channel: ... covered=-` 里，靠侦察看缺口，不靠猜。
+     *
+     * 刻意**不给**下载任务/安装完成/更新完成配特征串：那是用户自己点了才产生的通知，
+     * 误伤代价远大于多一条通知。核心服务（前台服务）同理。
+     */
+    static final String[] CHANNEL_MATCH = {
+            "recommend",      // 热门内容推荐推送
+            "push_noti",      // 热门内容推送（实测 com.heytap.marketpush_noti_high；也能命中 *push_notify_channel_id）
+            "tool",           // 应用运行状态 / 加速清理推广
+            "check_update",   // 可更新应用提醒
+            "self_updated",   // 商店自身更新进度
+    };
 
     // ── 资源 id 名（真机 dumpsys 视图树 + aapt2 资源表实测） ────────────────
     static final String ID_BOTTOM_TAB   = "fl_navi_menu_tab";

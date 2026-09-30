@@ -2,7 +2,7 @@
 
 OPPO / 欢太 **软件商店**（`com.heytap.market`）的 LSPosed 去广告模块。
 
-拦弹窗广告、筛底栏推广入口、逐项清理「我的」页的推广位。**16 项可独立开关**，
+拦弹窗广告、筛底栏推广入口、逐项清理「我的」页的推广位。**22 项可独立开关**，
 每项独立探针 + 命中计数，失效时如实上报而不是假装成功。
 
 ![License: GPL-3.0](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
@@ -32,6 +32,44 @@ OPPO / 欢太 **软件商店**（`com.heytap.market`）的 LSPosed 去广告模�
 ---
 
 ## 功能
+
+### 通知拦截 — 按通道分流，营销的拦、你自己点的全留
+
+| 开关 | 对应页面 | 做法 |
+|---|---|---|
+| 热门内容推荐推送 | 通知栏里的推荐广告 | 拦 `NotificationManager.notify` |
+| 热门内容推送（高优先级） | 通知栏里 importance=4 的推送（会震动/响铃） | 同上 |
+| 应用运行状态提示 | 通知栏里的加速/清理推广 | 同上 |
+| 可更新应用提醒 | 「有 N 个应用可更新」 | 同上（默认关） |
+| 商店自身更新进度 | 商店自己更新时的进度条 | 同上（默认关） |
+| 通知侦察 | — | **不拦任何通知**，只把实际出现的通道与标题记进日志 |
+
+**为什么不直接关通知权限**：一刀切会把**下载任务、安装完成、更新完成**一起弄没，
+而那三条是用户自己点了才产生的，误伤代价远大于多一条通知。所以在 `notify()` 这一步按通道分流，
+命中的直接不往下走，通知根本不会到系统。
+
+**推送不一定发在主进程**。本 App 声明了 11 个子进程，推送由
+`com.heytap.market:rhea`（OPPO 推送 SDK）与 `com.heytap.market:background` 发出。
+模块只在这两个子进程装**通知**闸门（不装界面/广告规则），其余 8 个子进程照旧跳过。
+
+**查看 App 实际推了哪些通道**：打开「通知侦察」，强停并启动 App，然后
+
+```powershell
+adb shell logcat -d | Select-String 'noti_channel|noti_scan|noti blocked'
+```
+
+会逐条打出 `id / 名称 / 重要度 / 已被哪条规则覆盖`：
+
+```
+noti_channel: id=com.heytap.marketpush_noti_high name=热门内容推送 importance=4 covered=noti_push_high
+noti_channel: id=download_task_notify_channel_id name=下载任务提醒 importance=3 covered=-
+noti_channel: id=Foreground_Channel_Id name=核心服务 importance=3 covered=-
+noti_scan: channels=3 covered=1
+```
+
+`covered=-` 表示这条通道目前没有规则覆盖。**运行期通道 id 和 dex 里的资源名不是一回事**
+（资源 `platform_download_task_notification` → 运行期 `download_task_notify_channel_id`），
+所以缺口靠侦察看，不靠猜；发现新通道后按它的 `id` 补一条特征串即可。
 
 ### 广告拦截 — 决策闸门，命中一次即不再出现
 
@@ -123,7 +161,7 @@ OPPO / 欢太 **软件商店**（`com.heytap.market`）的 LSPosed 去广告模�
 
 ## 怎么看效果 / 排查
 
-设置页点「**查看兼容结果**」，会列出 16 项的实时状态：
+设置页点「**查看兼容结果**」，会列出 22 项的实时状态：
 
 - `✔ 已验证拦截` — 安装期自检已确认拦截器真的吃掉了调用
 - `✓ 已生效` — 规则已装上，且确实拦到过（`hit=`）
