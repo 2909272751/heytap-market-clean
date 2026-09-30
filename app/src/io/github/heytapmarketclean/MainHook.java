@@ -16,6 +16,7 @@ import android.os.Looper;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewTreeObserver;
 import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
@@ -120,6 +121,14 @@ public final class MainHook extends XposedModule {
      * 所以多跑几轮只可能「藏得更多」，结构上不可能造成「闪一下又出现」。
      */
     private static final long[] APPLY_DELAYS = {0L, 200L, 600L, 1500L, 3000L, 5000L};
+
+    /**
+     * 绘制前兜底的帧数上限（≈330ms @60fps）。
+     *
+     * **不要**拿它去覆盖「我的」页那 1s 的异步下发窗口——帧数管不住时间，
+     * 真正处理那条路径的是 installInflateTriggers（在内容创建时拦）。
+     */
+    private static final int PRE_DRAW_MAX_PASSES = 20;
 
     private String processName;
 
@@ -230,10 +239,18 @@ public final class MainHook extends XposedModule {
         } catch (Throwable ignored) { }
     }
 
+    /**
+     * 命中总次数（每命中一次就 +1，跟「首次命中」那个标志位分开）。
+     * 绘制前守卫靠它判断「这一帧还有没有新东西被藏掉」，连续两帧没变化就摘掉自己。
+     */
+    private static final java.util.concurrent.atomic.AtomicInteger HIT_TOTAL =
+            new java.util.concurrent.atomic.AtomicInteger();
+
     /** 记一次命中（重复调用只有第一次写日志），并触发一次延迟的状态+命中汇总。 */
     static void hit(String rule) {
         // 自检期间的调用不算真实命中：那是模块自己调的，不是用户遇到了广告
         if (selfTest) { VERIFIED.add(rule); return; }
+        HIT_TOTAL.incrementAndGet();
         try {
             java.util.concurrent.atomic.AtomicBoolean flag = HITS.get(rule);
             if (flag == null) {
@@ -539,6 +556,17 @@ public final class MainHook extends XposedModule {
         // 它们的匹配结果由资源 id 解析情况决定（miss / partial / matched 都如实上报）。
         // 底栏的状态由上面的 installBottomBarPrune 决定（资源 id 在不在已经不重要，
         // 只要能拿到 tab 文案就能筛）；这里只保留资源 id 解析作为补充信息。
+        // UI 类规则：按资源 id / 结构隐藏，统一由 onResume + 切页事件驱动。
+        // 它们的匹配结果由资源 id 解析情况决定（miss / partial / matched 都如实上报）。
+        // 底栏的状态由上面的 installBottomBarPrune 决定（资源 id 在不在已经不重要，
+        // 只要能拿到 tab 文案就能筛）；这里只保留资源 id 解析作为补充信息。
+        // installInflateTriggers 是「异步下发内容」这条路径的正解：定时扫描挡不住 1s 后的落地。
+        if (anyUiRule()) {
+            try { installInflateTriggers(loader); }
+            catch (Throwable error) {
+                log(Log.WARN, TAG, "inflate triggers unavailable (UI rules fall back to timed scans)", error);
+            }
+        }
         probeUi(Config.F_BOTTOM_BAR, K_BOTTOM_NAV, K_TAB_LABEL_LARGE, K_TAB_LABEL_SMALL);
         probeUi(Config.F_TOP_BANNER, K_TOP_STAGE, K_TOP_BANNER);
 
@@ -1001,6 +1029,12 @@ public final class MainHook extends XposedModule {
 
     private static void schedule(Handler handler, final Activity activity) {
         if (activity == null || activity.isFinishing()) return;
+        // 绘制前守卫：真正消除闪烁的就是它。定时扫描退居二线，只当兜底
+        // （理论上每帧都会跑到，但要是不 attach（无窗口）还有定时这一道保险）。
+        try {
+            View decor = activity.getWindow().getDecorView();
+            if (decor != null) installPreDrawGuard(decor);
+        } catch (Throwable ignored) { }
         Runnable task = new Runnable() {
             @Override public void run() {
                 try { applyRules(activity); } catch (Throwable ignored) { }
@@ -1050,12 +1084,224 @@ public final class MainHook extends XposedModule {
     }
 
     /** 每次触达只做十几次 findViewById（按 id 精确命中），不做任何树遍历。 */
+    /**
+     * 在「内容被创建的那一刻」套用规则 —— 真正消除闪烁的那一步。
+     *
+     * ── 问题 ──
+     * 「我的」页的推广元素是异步下发的，切页后约 1s 才进视图树。定时扫描
+     * `{0, 200, 600, 1500, 3000, 5000}` 在 t=0 时它们还不存在，要等到下一档
+     * 才藏得住，中间那段时间用户看得见。真机逐帧抓到的闪现节点：
+     *   ll_uninstall / iv_not_uninstall / download_icon / upgrade_icon / line
+     *   scroll_banner
+     *   vip_layout
+     * （`iv_not_uninstall` 就是三宫格里那个圆形图标。）
+     * 换句话说：**凡是靠「事后隐藏」实现的规则都有这个闪的问题**，
+     * 每加一个开关就得重新踩一次。底栏那次的结论在这里同样成立。
+     *
+     * ── 做法 ──
+     * 拦两个「新建视图」的事件，都在第一帧绘制之前：
+     *  1. `ViewStub.inflate()` —— 角标、空态图标这些占位替换都走这里；
+     *  2. `RecyclerView.onViewAttachedToWindow(holder)` —— 列表项进窗口的瞬间。
+     * 两者都是**事件驱动**：不来就不执行，稳态零开销，不是轮询。
+     * 命中的只有「刚加进来的那一小块子树」，扫描面很小。
+     *
+     * 触发时机上它们都在 measure/layout/draw 之前，所以置 GONE 之后
+     * 这块内容**一帧都没被画出来过**——这就是不闪的保证。
+     */
+    private void installInflateTriggers(ClassLoader loader) throws Exception {
+        int hooked = 0;
+
+        // 1) ViewStub.inflate：角标 / 空态插图 / 延迟卡片
+        try {
+            Class<?> stub = loader.loadClass("android.view.ViewStub");
+            for (Method m : stub.getMethods()) {
+                if (!"inflate".equals(m.getName())) continue;
+                if (m.getReturnType() != View.class) continue;
+                m.setAccessible(true);
+                hook(m).setId(Config.MODULE + "_stub_inflate").intercept(new XposedInterface.Hooker() {
+                    @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                        Object result = chain.proceed();
+                        try { applyRulesToFresh(result); } catch (Throwable ignored) { }
+                        return result;
+                    }
+                });
+                hooked++;
+            }
+        } catch (Throwable error) {
+            log(Log.WARN, TAG, "ViewStub.inflate trigger unavailable", error);
+        }
+
+        // 2) RecyclerView.onViewAttachedToWindow：列表项挂到窗口的瞬间
+        try {
+            Class<?> rv = loader.loadClass("androidx.recyclerview.widget.RecyclerView");
+            for (Method m : rv.getMethods()) {
+                if (!"onViewAttachedToWindow".equals(m.getName())) continue;
+                m.setAccessible(true);
+                hook(m).setId(Config.MODULE + "_rv_attach").intercept(new XposedInterface.Hooker() {
+                    @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                        Object result = chain.proceed();
+                        try { applyRulesToFresh(holderItemView(chain.getArg(0))); } catch (Throwable ignored) { }
+                        return result;
+                    }
+                });
+                hooked++;
+            }
+        } catch (Throwable error) {
+            log(Log.WARN, TAG, "RecyclerView attach trigger unavailable", error);
+        }
+
+        // 3) ViewGroup.addView：普通布局 inflate 出来的视图（静态头部那些）
+        //    —— 静态布局既不走 ViewStub 也不走 RecyclerView，只有这一条路能拦到。
+        //    实测「我的」页的 ll_uninstall（应用卸载格）就是这一类，
+        //    只装前两个触发点时它仍然会闪一下。
+        try {
+            Class<?> vg = loader.loadClass("android.view.ViewGroup");
+            for (Method m : vg.getDeclaredMethods()) {
+                if (!"addView".equals(m.getName())) continue;
+                Class<?>[] params = m.getParameterTypes();
+                if (params.length != 3 || params[0] != View.class) continue;
+                m.setAccessible(true);
+                hook(m).setId(Config.MODULE + "_vg_addview").intercept(new XposedInterface.Hooker() {
+                    @Override public Object intercept(XposedInterface.Chain chain) throws Throwable {
+                        Object result = chain.proceed();
+                        try {
+                            Object child = chain.getArg(0);
+                            if (child instanceof View) hideOnAttach((View) child);
+                        } catch (Throwable ignored) { }
+                        return result;
+                    }
+                });
+                hooked++;
+            }
+        } catch (Throwable error) {
+            log(Log.WARN, TAG, "ViewGroup.addView trigger unavailable", error);
+        }
+
+        if (hooked == 0) throw new NoSuchMethodException("no inflate/attach trigger found");
+        log(Log.INFO, TAG, "inflate triggers installed: " + hooked + " method(s)");
+    }
+
+    /**
+     * 视图刚被挂上父容器时，按 id 直接置 GONE。
+     *
+     * 只处理**按资源 id 命中**的那些规则——这正是会闪现的那一批
+     * （ll_uninstall / vip_layout / scroll_banner / 悬浮广告 / 首页横幅 …）。
+     * 结构类规则（推荐卡靠 HorizontalAppItemView 识别）和「三项全开就整卡隐藏」
+     * 这类需要看父容器关系的，仍由定时扫描兜底，不在这里做。
+     *
+     * 命中率上：addView 是布局填充时的高频调用，所以拦截器里只有一次
+     * `getId()` 加一次十几个 int 的定长比对；id 对不上直接返回。
+     *
+     * ⚠️ **必须先查开关**：这一条漏查过一次，后果是「待更新」「下载管理」
+     * （两者默认都是关的）也被藏掉，三宫格三个格子全空，整个「我的」页变空白——
+     * 页面只剩底栏两个字。applyRulesToRoot 里每条规则前面都有 `if (ON[...])`，
+     * 这里也得有，否则就绕过了用户的设置。
+     */
+    private static void hideOnAttach(View v) {
+        try {
+            int id = v.getId();
+            if (id == 0 || id == View.NO_ID) return;
+            int idx = idIndex(id);
+            if (idx < 0) return;
+            if (!ON[idx]) return;                   // 开关关着就绝不能动
+            if (v.getVisibility() == View.GONE) return;
+            v.setVisibility(View.GONE);
+            hit(Config.FEATURES[idx]);
+        } catch (Throwable ignored) { }
+    }
+
+    /** id → Config.FEATURES 下标；不是规则目标返回 -1。定长扫描，无需 Map。 */
+    private static int idIndex(int id) {
+        for (int i = 0; i < ID_COUNT; i++) {
+            if (ID[i] == id) return featureIndexOf(i);
+        }
+        return -1;
+    }
+
+    /** K_* 常量 → Config.FEATURES 下标（两个数组是一一对应的，顺序按声明排列）。 */
+    private static int featureIndexOf(int k) {
+        switch (k) {
+            case K_FLOAT_AD: return I_FLOAT;
+            case K_TOP_BANNER: return I_TOPBANNER;
+            case K_MINE_UPGRADE: return I_UPGRADE;
+            case K_MINE_UNINSTALL: return I_UNINSTALL;
+            case K_MINE_DOWNLOAD: return I_DOWNLOAD;
+            case K_MINE_CLEAN: return I_CLEAN;
+            case K_MINE_HEALTH: return I_HEALTH;
+            case K_MINE_BANNER: return I_BANNER;
+            case K_MINE_VIP: return I_VIP;
+            default: return -1;     // 其余 id（底栏、角标、列表等）不走这条路径
+        }
+    }
+
+    /** ViewHolder.itemView 是 public final 字段，直接读；读不到就放弃。 */
+    private static View holderItemView(Object holder) {
+        if (holder == null) return null;
+        try {
+            Object v = holder.getClass().getField("itemView").get(holder);
+            return v instanceof View ? (View) v : null;
+        } catch (Throwable ignored) { return null; }
+    }
+
+    /** 对刚创建/刚挂上的这块内容套规则；同时也看它现在的父容器（布局参数可能挂在外层）。 */
+    private static void applyRulesToFresh(Object fresh) {
+        if (!(fresh instanceof View)) return;
+        View view = (View) fresh;
+        applyRulesToRoot(view);
+        try {
+            android.view.ViewParent parent = view.getParent();
+            if (parent instanceof View) applyRulesToRoot((View) parent);
+        } catch (Throwable ignored) { }
+    }
+
     private static void applyRules(Activity activity) {
         View decor;
         try { decor = activity.getWindow().getDecorView(); }
         catch (Throwable ignored) { return; }
         if (decor == null) return;
+        applyRulesToRoot(decor);
+    }
 
+    /**
+     * 绘制前守卫：把规则挂到 decor 的 OnPreDrawListener 上，**短时兜底**。
+     *
+     * ── 这一版的定位（上一版想错了一轮，留个记录）──
+     * 最初以为只要「绘制前」就万事大吉，忽略了两个事实：
+     *  1. 按**帧**设上限管不住**时间**：60fps 下 12 帧只有 200ms，
+     *     而「我的」页的卡片是切页后约 1s 才由网络下发落地的
+     *     （真机帧计数：帧1 643 节点 → 帧3 840 → 帧5 1009 → 帧7 1157 稳定）；
+     *  2. 「连续两帧没命中就摘掉」这个提前退出的判据更糟——
+     *     异步内容落地前本来就没有东西可命中，它会在第 2 帧就摘自己。
+     *
+     * 所以**真正消除闪烁的是 installInflateTriggers**（在内容被创建的那一刻拦），
+     * 这里只是同一帧内的最后一道保险，20 帧（≈330ms）就摘。
+     *
+     * 开销：只在切页/回前台时挂，最多 20 帧即摘；稳态不挂监听器、不轮询。
+     */
+    private static void installPreDrawGuard(final View decor) {
+        if (!anyUiRule()) return;
+        try {
+            ViewTreeObserver vto = decor.getViewTreeObserver();
+            if (vto == null || !vto.isAlive()) return;
+            vto.addOnPreDrawListener(new ViewTreeObserver.OnPreDrawListener() {
+                private int passes = 0;
+
+                @Override public boolean onPreDraw() {
+                    passes++;
+                    try { applyRulesToRoot(decor); } catch (Throwable ignored) { }
+                    if (passes >= PRE_DRAW_MAX_PASSES) {
+                        try {
+                            ViewTreeObserver live = decor.getViewTreeObserver();
+                            if (live != null) live.removeOnPreDrawListener(this);
+                        } catch (Throwable ignored) { }
+                    }
+                    return true;
+                }
+            });
+        } catch (Throwable ignored) { }
+    }
+
+    private static void applyRulesToRoot(View decor) {
         // 底栏不再在这里按文案筛：改由 buildMenuView 钩子在建视图时移除，
         // 见 installBottomBarPrune —— 延迟隐藏正是「闪一下」的成因。
         // 均分不需要任何额外干预：菜单项一旦设为不可见，COUI 的 onMeasure 自然按新项数均分。

@@ -10,10 +10,11 @@ $ErrorActionPreference = 'Stop'
 
 $VERSION = '0.6.0'
 # Module self-reported versionCode. Declared HERE, next to $VERSION, on purpose:
-# the APK file name, module.prop's version= and versionCode= used to be three
-# hand-maintained values that could drift apart, which is how a fixed build
-# ended up still shipping under the label of the buggy one. build.ps1 now
-# injects both into module.prop, so bumping the version is a one-line change.
+# the version used to live in three hand-maintained places (APK file name,
+# module.prop, AndroidManifest.xml) that drifted apart — v0.6.0 shipped with the
+# module list saying 0.6.0 while the system app-info page still said 0.2.0, which
+# is exactly the drift this single-variable approach exists to prevent.
+# Both files now carry placeholders that this script substitutes.
 $VERSION_CODE = 6
 
 $app = $PSScriptRoot
@@ -63,6 +64,21 @@ foreach ($folder in @('stub-src', 'src', 'res', 'META-INF', 'libs')) {
     if (Test-Path -LiteralPath $from) { Copy-Item -LiteralPath $from -Destination $stage -Recurse -Force }
 }
 Copy-Item -LiteralPath (Join-Path $app 'AndroidManifest.xml') -Destination $stage
+
+# Inject the version into the STAGED manifest (never the source file).
+#
+# The source manifest carries @VERSION@ / @VERSION_CODE@ placeholders. Leaving a
+# real version in the source is how v0.6.0 shipped: the module list showed 0.6.0
+# (module.prop) while the system "app info" page still showed 0.2.0 (manifest) —
+# the same three-way drift this variable exists to prevent. Fail loudly instead.
+$stagedManifest = Join-Path $stage 'AndroidManifest.xml'
+$manifestText = [IO.File]::ReadAllText($stagedManifest, [Text.Encoding]::UTF8)
+if ($manifestText -notmatch '@VERSION@' -or $manifestText -notmatch '@VERSION_CODE@') {
+    throw "AndroidManifest.xml is missing the @VERSION@ / @VERSION_CODE@ placeholders. Refusing to build with a hand-written version that can drift from `$VERSION."
+}
+$manifestText = $manifestText.Replace('@VERSION@', $VERSION).Replace('@VERSION_CODE@', $VERSION_CODE)
+[IO.File]::WriteAllText($stagedManifest, $manifestText, (New-Object Text.UTF8Encoding($false)))
+Write-Host "AndroidManifest.xml -> versionName=$VERSION versionCode=$VERSION_CODE"
 
 # Inject the version into module.prop so the APK file name and the version the
 # module reports inside the framework can never disagree.

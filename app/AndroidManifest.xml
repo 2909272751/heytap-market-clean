@@ -1,9 +1,21 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
-<!-- 鍗犱綅绗︼細io.github.heytapmarketclean = 妯″潡鍖呭悕锛堝 io.github.xxxclean锛夛紱杞欢鍟嗗簵鍑€鍖?= 璁剧疆椤垫樉绀哄悕 -->
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  占位符说明：
+    io.github.heytapmarketclean = 模块包名（如 io.github.xxxclean）
+    软件商店净化             = 设置页显示名
+
+  版本号**不要**在这里手写。build.ps1 在 aapt2 link 之前会把下面两个占位符
+  替换成 $VERSION / $VERSION_CODE；占位符不存在时构建直接失败。
+
+  为什么要这样：版本号曾经是「文件名 / module.prop / 本清单」三处手工维护的值，
+  早就漂移过一次 —— 发了 v0.6.0，模块列表显示 0.6.0（读 module.prop），
+  系统「应用信息」却还是 0.2.0（读本清单）。现在只有 build.ps1 的 $VERSION
+  是唯一事实源，改版本只需要改那一行。
+-->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="io.github.heytapmarketclean"
-    android:versionCode="2"
-    android:versionName="0.2.0">
+    android:versionCode="@VERSION_CODE@"
+    android:versionName="@VERSION@">
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="34" />
 
     <application
@@ -20,19 +32,19 @@
             </intent-filter>
         </activity>
 
-        <!-- LSPosed 妗嗘灦鏈嶅姟閫氶亾锛堣缃〉涓庢鏋堕€氫俊锛夛紱authorities 鍥哄畾涓?<妯″潡鍖呭悕>.XposedService -->
+        <!-- LSPosed 框架服务通道（设置页与框架通信）；authorities 固定为 <模块包名>.XposedService -->
         <provider
             android:name="io.github.libxposed.service.XposedProvider"
             android:authorities="io.github.heytapmarketclean.XposedService"
             android:exported="true" />
 
-        <!-- 鐩爣杩涚▼ 鈫?璁剧疆椤?鐨勭姸鎬佹煡璇㈤€氶亾锛堝彧璇伙級 -->
+        <!-- 目标进程 → 设置页的状态查询通道（只读） -->
         <provider
             android:name=".StatusProvider"
             android:authorities="io.github.heytapmarketclean.status"
             android:exported="true" />
 
-        <!-- 鐩爣杩涚▼ 鈫?璁剧疆椤?鐨勪竴娆℃€х姸鎬佷笂鎶?-->
+        <!-- 目标进程 → 设置页的一次性状态广播 -->
         <receiver android:name=".StatusReceiver" android:exported="true">
             <intent-filter><action android:name="io.github.heytapmarketclean.REPORT" /></intent-filter>
         </receiver>
